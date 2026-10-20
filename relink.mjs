@@ -47,13 +47,23 @@ import { createRequire } from 'node:module'
 
 const AUTH = path.dirname(fileURLToPath(import.meta.url))
 const PKG_NAME = 'dsh-baipiao-shigege'
-const PROFILE = path.resolve(AUTH, '..', '..', 'profiles', 'desktop')
+const argv = new Set(process.argv.slice(2))
+/**
+ * profile 位置。
+ *
+ * 默认从 ~/.dsh/profiles/desktop 推导——它由 HOME 环境变量决定，所以无论
+ * 权威副本放在哪里，relink 都能定位到当前机器的 profile。传 `--profile <路径>`
+ * 可显式指定。
+ */
+const HOME = process.env.HOME ?? process.env.USERPROFILE
+const PROFILE = argv.has('--profile')
+  ? path.resolve(process.argv[process.argv.indexOf('--profile') + 1])
+  : path.resolve(HOME, '.dsh', 'profiles', 'desktop')
 const MODULES = path.join(PROFILE, 'node_modules')
 const LINK = path.join(MODULES, PKG_NAME)
 const PROFILE_PKG = path.join(PROFILE, 'package.json')
 const PROFILE_LOCK = path.join(PROFILE, 'pnpm-lock.yaml')
 
-const argv = new Set(process.argv.slice(2))
 const CHECK = argv.has('--check')
 const DRY = argv.has('--dry-run') || CHECK
 const STAMP = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)

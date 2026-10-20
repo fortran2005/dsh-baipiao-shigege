@@ -116,6 +116,90 @@ export const DEFAULTS = Object.freeze({
    * 「明显卡顿」的保守起点。
    */
   minTokensPerSecond: 50,
+  /**
+   * 吞吐淘汰线（tokens/s）：实测低于它的模型**不进入任何链**。
+   *
+   * ## 与 `minTokensPerSecond` 的区别（两者必须分开）
+   *
+   *   - `minTokensPerSecond` 是**请求期**判定：这一次流出来的正文太慢，就中止
+   *     当前候选、换下一个。它只影响「这一轮」。
+   *   - `excludeBelowTps` 是**分层期**判定：模型被实测证明「就是慢」，那么它
+   *     连候选都不该当——用户明确要求「低于 50 tok/s 的直接取消选择，不进组合
+   *     模型」。
+   *
+   * 两条一起用才是完整语义：慢的模型既不该被排到前面，也不该占着候选名额在
+   * 链尾兜底——兜底一次就要用户多等十几秒。
+   *
+   * 0 = 关闭淘汰（只排序、不删除）。**没有实测数据的模型不会被淘汰**：淘汰的
+   * 前提是「测出来慢」，而不是「还没测」——否则启动瞬间所有模型都会被清空。
+   */
+  excludeBelowTps: 50,
+  /**
+   * 吞吐分档的档宽（tokens/s）。
+   *
+   * 排序不是严格的逐个 tps 降序，而是「先按吞吐分档、档内按价格」：
+   * 60 与 80 tok/s 的用户体感差别远小于 0.05 与 5 倍率的价格差别，硬按 tps
+   * 排会让贵的模型仅仅因为快 5% 就挤到前面。
+   *
+   * 0 = 不分档（严格按 tps 降序）。
+   */
+  throughputBandTps: 25,
+  /**
+   * 「快速档」大小：真正被轮换调用的只有吞吐最高的前 N 个。
+   *
+   * ## 为什么不是「整条链轮流」
+   *
+   * 整条链轮流会让一个排在很后面的模型偶尔当链首——用户为它付出一次慢的代价，
+   * 却只换来「用量分散」。快速档把轮换限制在**已经证明最快的那几个**里：
+   *
+   *   - 调用永远落在快的模型上（用户要的速度）；
+   *   - 同档内轮流当链首，用量不会全压在第一名上（用户要的分散 + 风控）；
+   *   - 快速档全部失败时仍然按原顺序降级到档外，可用性不受影响。
+   *
+   * 1 = 永远只用最快的那一个（最激进）；0 或负数等同 1。取值大于候选数时按
+   * 候选数截断。
+   */
+  fastBandSize: 3,
+  /**
+   * 每次启动软件后，是否自动跑一次「重测全部」。
+   *
+   * 用户明确要求「每次开启软件就自动运行一次重测全部」。探测按渠道分组、
+   * 单账号串行、带 200–500ms 抖动，所以它不会像「同时打几十个请求」那样触发
+   * 风控；而且它在后台跑，不影响任何一次对话的延迟。
+   *
+   * 但**刚测过就不重复测**：见 `startupProbeSkipMinutes`。
+   */
+  probeOnStartup: true,
+  /**
+   * 启动重测的跳过窗口（分钟）：上一轮探测在这么多分钟内完成过，就不再重测。
+   *
+   * 作用场景是「一天里反复开关软件」——每次开都跑一轮全量探测既没必要，也是
+   * 最容易被上游看出规律的那类流量。0 = 每次都测。
+   */
+  startupProbeSkipMinutes: 10,
+  /**
+   * 账号排序：优先用「积分快到期」的账号。
+   *
+   * 渠道包自己按**用户拖拽的顺序**选号（数组第一个可用账号），它不知道谁的
+   * 积分要过期。本插件把各账号的积分包到期时间读出来，把快过期的账号排到
+   * 该渠道的最前面，再通过渠道包的 `account.reorder` 落地——于是「先用会作废
+   * 的额度」变成了真实的选号顺序，而不只是一个展示字段。
+   */
+  accountExpiryFirst: true,
+  /**
+   * 账号轮换：除快到期账号外，其余账号轮流当第一顺位。
+   *
+   * 这是「不要集中用几个账号」的落点。与快速档轮换同理：只改变**起点**，不改变
+   * 「失败就换下一个」的语义。轮换按渠道分别计游标，互不干扰。
+   */
+  accountRotation: true,
+  /**
+   * 账号重排的节流间隔（分钟）。
+   *
+   * `account.reorder` 会写一次渠道包的设置文件。每次刷新都写既无必要，也会让
+   * 「顺序」变得不可观察。10 分钟足够跟上积分到期与用量分布的变化。
+   */
+  accountReorderMinutes: 10,
   /** 判定速度前至少观察多少毫秒；太短的样本会被网络抖动放大。 */
   speedSampleMs: 3000,
   /** 慢模型记忆保留多久（分钟）；过期后重新给它机会。 */
@@ -262,6 +346,30 @@ try {
     minTokensPerSecond: Schema.number()
       .default(DEFAULTS.minTokensPerSecond)
       .description('输出速度低于这个值（tokens/s）就换下一个模型，并把它排到链尾；0 = 不判定速度'),
+    excludeBelowTps: Schema.number()
+      .default(DEFAULTS.excludeBelowTps)
+      .description('实测吞吐低于这个值（tokens/s）的模型不进任何链（等于「取消选择」）；没测过的不受影响，0 = 不淘汰'),
+    fastBandSize: Schema.number()
+      .default(DEFAULTS.fastBandSize)
+      .description('只有吞吐最高的前 N 个模型参与轮流调用；档外模型仍可兜底，1 = 永远只用最快的'),
+    throughputBandTps: Schema.number()
+      .default(DEFAULTS.throughputBandTps)
+      .description('吞吐分档的档宽（tokens/s）：跨档按吞吐排，同档内按到期→倍率排；0 = 严格按吞吐'),
+    probeOnStartup: Schema.boolean()
+      .default(DEFAULTS.probeOnStartup)
+      .description('每次启动软件后自动跑一次「重测全部」（后台进行，不影响对话）'),
+    startupProbeSkipMinutes: Schema.number()
+      .default(DEFAULTS.startupProbeSkipMinutes)
+      .description('上一轮测速在这么多分钟内完成过，启动时就不重复测；0 = 每次都测'),
+    accountExpiryFirst: Schema.boolean()
+      .default(DEFAULTS.accountExpiryFirst)
+      .description('优先用积分快到期的账号（会重排渠道包里的选号顺序）'),
+    accountRotation: Schema.boolean()
+      .default(DEFAULTS.accountRotation)
+      .description('其余账号轮流当第一顺位，避免用量集中在少数账号上'),
+    accountReorderMinutes: Schema.number()
+      .default(DEFAULTS.accountReorderMinutes)
+      .description('账号顺序重排的节流间隔（分钟）；0 = 每轮分层都重排'),
     speedSampleMs: Schema.number()
       .default(DEFAULTS.speedSampleMs)
       .description('判定速度前至少观察多少毫秒（太短的样本会被网络抖动放大）'),
@@ -311,9 +419,24 @@ try {
 
 // ── 工具 ────────────────────────────────────────────────────────────────────
 
+/**
+ * 数据根目录。
+ *
+ * 解析顺序（就近优先）：
+ *   1. DSH_HOME 环境变量（测试与多实例场景）
+ *   2. 插件目录旁的 .runtime-data —— 让「插件放在哪，数据就在哪」。
+ *      开发副本（E 盘工作目录）与安装副本（~/.dsh/local-plugins）各自
+ *      带着自己的设置与速度画像，互不串扰；发布副本没有这个目录时
+ *      自动落回第 3 条，行为与旧版一致。
+ *   3. ~/.dsh —— 传统位置，兼容老用户已有的数据。
+ */
+const LOCAL_DATA = path.join(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), '.runtime-data')
 function dshHome() {
   const fromEnv = process.env.DSH_HOME
   if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv.trim()
+  try {
+    if (fs.existsSync(path.join(LOCAL_DATA, 'settings.json'))) return LOCAL_DATA
+  } catch { /* 目录不可读时按无此路径处理 */ }
   return path.join(os.homedir(), '.dsh')
 }
 
@@ -706,7 +829,8 @@ export async function fetchRows(config) {
  *
  * @param {Array<object>} rows - `fetchRows` 的输出（就地修改）
  * @param {object} deps - `{ rpc(provider), windowDays }`
- * @returns {Promise<{annotated:string[], skipped:string[]}>}
+ * @returns {Promise<{annotated:string[], skipped:string[], credits:object, accounts:object}>}
+ *   `accounts` 是逐账号的积分明细（见下文 `accountsOf`），供账号排序使用。
  */
 export async function annotateExpiry(rows, deps) {
   const windowDays = positive(deps?.windowDays, DEFAULTS.expiringWindowDays)
@@ -723,6 +847,17 @@ export async function annotateExpiry(rows, deps) {
    * 快到期」——用户关心的是「我现在还能花多少」，不是一个笼统的布尔值。
    */
   const credits = {}
+  /**
+   * 逐**账号**的积分明细。
+   *
+   * 形状：`{ [provider]: [{ accountId, nickname, total, expiring, nearestEnd }] }`
+   *
+   * 渠道级汇总只能回答「这个渠道有没有快过期的积分」，而账号排序需要的是
+   * 「**哪个账号**的积分最先作废」——渠道包按账号列表顺序选号，要把快过期的
+   * 账号顶到前面，就必须知道每个账号自己的数字。`nearestEnd` 是「最近一个
+   * 会作废的积分包的截止时刻」，0 表示没有带期限的包。
+   */
+  const accountsOf = {}
 
   for (const provider of providers) {
     let payload
@@ -738,18 +873,33 @@ export async function annotateExpiry(rows, deps) {
     let expiring = 0
     let total = 0
     let sawAnyPackage = false
+    const perAccount = []
     for (const account of accounts) {
       const packages = Array.isArray(account?.balance?.packages) ? account.balance.packages : []
+      let accountTotal = 0
+      let accountExpiring = 0
+      let nearestEnd = 0
       for (const pkg of packages) {
         const remaining = Number(pkg?.remaining)
         if (!Number.isFinite(remaining) || remaining <= 0) continue
         sawAnyPackage = true
         total += remaining
+        accountTotal += remaining
         const end = Number(pkg?.deductionEndTime)
         if (!Number.isFinite(end) || end <= 0) continue
         // 已经过期的包不计入「还能花多少」。
-        if (end <= now) { total -= remaining; continue }
-        if (end - now <= windowMs) expiring += remaining
+        if (end <= now) { total -= remaining; accountTotal -= remaining; continue }
+        if (nearestEnd === 0 || end < nearestEnd) nearestEnd = end
+        if (end - now <= windowMs) { expiring += remaining; accountExpiring += remaining }
+      }
+      if (typeof account?.accountId === 'string' && account.accountId !== '') {
+        perAccount.push({
+          accountId: account.accountId,
+          nickname: typeof account.nickname === 'string' ? account.nickname : '',
+          total: accountTotal,
+          expiring: accountExpiring,
+          nearestEnd,
+        })
       }
     }
     // 一个积分包都没读到，说明这个渠道的余额协议不适用（或账号未登录）；
@@ -757,13 +907,132 @@ export async function annotateExpiry(rows, deps) {
     if (!sawAnyPackage) { skipped.push(provider); continue }
 
     credits[provider] = { total, expiring }
+    accountsOf[provider] = perAccount
     for (const row of rows) {
       if (row.provider === provider) row.expiringCredits = expiring
     }
     annotated.push(provider)
   }
 
-  return { annotated, skipped, credits }
+  return { annotated, skipped, credits, accounts: accountsOf }
+}
+
+/**
+ * 账号轮换游标（按渠道分开）。
+ *
+ * 为什么是「每个渠道一个游标」而不是全局一个：每个渠道的账号数是独立的，
+ * 全局游标会让账号少的渠道永远从同一个位置开始。
+ */
+const accountCursor = new Map()
+
+/** 测试缝：账号轮换游标是进程状态。 */
+export function resetAccountRotation() {
+  accountCursor.clear()
+}
+
+/**
+ * 计算某个渠道的**账号顺序**（只算，不落地）。
+ *
+ * ## 规则（用户新规则）
+ *
+ *   1. **积分快到期、且真的还有余额的账号排最前**——它们不用就作废；
+ *   2. 其余账号**轮流当第一顺位**（`accountRotation`）——避免用量集中在
+ *      最初的那一个账号上；
+ *   3. 查不到余额的账号夹在中间，既不当第一顺位，也不被丢到最后。
+ *
+ * ## 为什么「轮流」是从一个轮换点上取环形序列
+ *
+ * 渠道包的选号语义是「列表第一个可用账号」。要让它「轮流」，只能改列表顺序：
+ * 第 N 次重排把第 N 个账号转到队首。这不是随机打乱——顺序里仍然保留了
+ * 「到期优先」，只是把**同档内的起点**转了一下。
+ *
+ * ## 未启用的账号
+ *
+ * 停用的账号仍然参与排序（渠道包自己会跳过它们），但**不占用轮换起点**：
+ * 否则一个停用账号会白白消耗一个位置，让实际用量在剩下的账号里偏斜。
+ *
+ * @param {object} input
+ * @param {Array<{id:string, enabled?:boolean}>} input.accounts - 渠道包给出的账号（按其现有顺序）
+ * @param {Array<{accountId:string, total:number, expiring:number, nearestEnd:number}>|undefined} input.balances
+ * @param {string} input.provider
+ * @param {{expiryFirst?:boolean, rotation?:boolean, windowDays?:number}} [input.options]
+ * @returns {{ordered:string[], expiring:string[], cursor:number}}
+ */
+export function planAccountOrder(input) {
+  const provider = String(input?.provider ?? '')
+  const accounts = Array.isArray(input?.accounts) ? input.accounts : []
+  const balances = Array.isArray(input?.balances) ? input.balances : []
+  const options = input?.options ?? {}
+  const byId = new Map()
+  for (const row of balances) {
+    if (typeof row?.accountId === 'string') byId.set(row.accountId, row)
+  }
+  const now = Date.now()
+  const windowMs = positive(options.windowDays, DEFAULTS.expiringWindowDays) * 24 * 60 * 60 * 1000
+
+  /**
+   * 把账号分成三组：
+   *
+   *   - `expiring`：窗口内会作废、且剩余 > 0 —— 先用掉；
+   *   - `unknown`：查不到余额 —— 中间；
+   *   - `lasting`：只有长期积分（或余额为 0 但没到期）—— 最后。
+   *
+   * 余额为 0 的账号不放进 `expiring`：它没有可浪费的额度，而且很可能已经被
+   * 上游限流；排前面只会让请求先失败一次。但它**也不被移除**——降级时仍可以
+   * 落回去（渠道包自己会按限流标记过滤）。
+   */
+  const expiring = []
+  const unknown = []
+  const lasting = []
+  for (const account of accounts) {
+    const id = String(account?.id ?? '')
+    if (id === '') continue
+    const balance = byId.get(id)
+    if (options.expiryFirst === false || balance === undefined) { unknown.push(id); continue }
+    const end = Number(balance.nearestEnd)
+    const hasEnding = Number.isFinite(end) && end > now && end - now <= windowMs
+    if (hasEnding && Number(balance.expiring) > 0) expiring.push(id)
+    else lasting.push(id)
+  }
+  /**
+   * 到期组内部：**越早作废的越靠前**。
+   *
+   * 这是「先用快到期的」这条规则真正的落点——两个账号都在窗口内，先烧掉
+   * 下周就作废的那个，而不是下下周的那个。
+   */
+  const endOf = id => {
+    const balance = byId.get(id)
+    const end = Number(balance?.nearestEnd)
+    return Number.isFinite(end) && end > 0 ? end : Number.POSITIVE_INFINITY
+  }
+  expiring.sort((a, b) => endOf(a) - endOf(b))
+
+  /**
+   * 除到期组之外的那些账号：合并成一个序列后整体旋转。
+   *
+   * 为什么合并而不是两组各自旋转：渠道包只关心「谁是第一个」，分组内部各转
+   * 各的会让「未知」那一组永远压在「长期」之前——而它们其实同样该被轮换到。
+   * 合成一个序列再转，起点落在谁身上谁就先上；到期的那些仍然固定在最前面。
+   */
+  const rest = [...unknown, ...lasting]
+  const rotationOn = options.rotation !== false
+  let start = 0
+  if (rest.length > 1 && rotationOn) {
+    start = (accountCursor.get(provider) ?? 0) % rest.length
+    accountCursor.set(provider, (start + 1) % rest.length)
+  } else if (rest.length > 0) {
+    accountCursor.set(provider, 0)
+  }
+  const rotated = rest.length === 0 ? rest : [...rest.slice(start), ...rest.slice(0, start)]
+
+  return {
+    /** 该渠道的完整账号顺序（渠道包会按这个顺序选号）。 */
+    ordered: [...expiring, ...rotated],
+    /** 快到期、需要先用掉的账号（排在 `ordered` 最前面）。 */
+    expiring,
+    /** 本轮轮换起点落在 `rest` 的第几位；0 表示没有轮换。 */
+    cursor: start,
+  }
 }
 
 
@@ -783,6 +1052,29 @@ export async function annotateExpiry(rows, deps) {
  * `candidatesFor`），而不是靠单独开一条「1M+看图」链。这样选择器只有三项，
  * 用户不必为「这次要不要发图」换模型。
  *
+ * ## 排序的唯一主键：实测吞吐（从大到小）
+ *
+ * 用户的要求是「4 个分类里面的模型按照吞吐量从大到小排序，调用时优先调用
+ * 速度快的模型」。所以每条链的**首选排序键就是吞吐 tps 的降序**，不是倍率、
+ * 不是首字、也不是到期。
+ *
+ * 这里有一个必须讲清的分层关系：**吞吐决定「谁先上」，到期/倍率决定「内部
+ * 谁先上」**。完全按吞吐排会让 0.05 倍率与 5 倍率的模型混在一起，而用户既要
+ * 快也要省——所以链被切成若干「吞吐档」（同一个 25 tok/s 的桶），档内仍然按
+ * 到期 → 倍率排。跨档时吞吐优先，档内时省钱优先，两个诉求都不丢。
+ *
+ * 没有实测数据的模型不能当作「慢」（那会让新上架/刚重置的模型永久垫底），
+ * 也不能当作「快」（那会让没验证过的模型抢在前面）。它们单独一档，排在
+ * 「实测够快」之后、「实测偏慢」之前。
+ *
+ * ## 吞吐淘汰（`excludeBelowTps`）
+ *
+ * 实测吞吐低于门槛的模型**直接不进链**。这是用户明确要求的「低于 50 tok/s
+ * 的模型直接取消选择，不进入组合模型」。
+ *
+ * 判据必须是「测出来慢」，而不是「没测」：只淘汰**确知**慢的。同时 `slowModels`
+ * 里被请求期判慢的模型也算证据（它出现过并且很慢）。
+ *
  * ## 不浪费积分：到期优先，其次轮换
  *
  * 每个候选带一个 `expiryRank`：
@@ -791,8 +1083,8 @@ export async function annotateExpiry(rows, deps) {
  *   - `1`：余额未知（查不到）——不当作「没有」，排在已知到期之后；
  *   - `2`：只有长期积分。
  *
- * 同档内按倍率排。链的执行器还会在这一档内**轮换起点**，避免一直打同一个
- * 模型（用户明确要求「最好不要集中用一个模型」）。
+ * 链的执行器还会在**快速档内**轮换起点，避免一直打同一个模型（用户明确要求
+ * 「最好不要集中用一个模型」）。
  *
  * @param {Array<object>} rows - `fetchRows` 的输出，每行可带 `expiringCredits`
  * @param {object} config
@@ -831,56 +1123,89 @@ export function buildTiers(rows, config) {
   }
 
   /**
-   * 实测速度优先的排序。
+   * 吞吐为主键的排序器。
    *
-   * ## 为什么需要它
+   * ## 为什么主键换成吞吐（用户新规则）
    *
-   * 实测暴露的真实问题：链首的 `workbuddy/hy4-preview-f`（0 积分、按倍率排第一）
-   * 首字要 **20.8 秒**才失败，而同链的 `lobsterai/deepseek-flash`（0.05 倍率）
-   * 首字 **1.2 秒**就答完。按「免费优先」的直觉排序，用户实际等的是 20 秒。
+   * 用户的原话是「4 个分类里面的模型按照吞吐量从大到小排序，调用的时候就优先
+   * 调用速度快的模型」。所以排序的第一关键字是**实测吞吐 tps 降序**。
    *
-   * ## 规则（按优先级）
+   * ## 分档：跨档看吞吐，档内看省钱
    *
-   *   1. **实测慢的沉到最后**——已经证明慢的模型不该再抢在前面。判据是首字
-   *      超过 `slowTtfbMs`（默认 10s）或吞吐低于 `minTokensPerSecond`。
-   *   2. **实测快的排在没数据的前面**——快数据是「真的能用且快」的证据。
-   *   3. 都有快数据时按首字升序。
-   *   4. 其余回落到「到期优先 → 倍率」，保持原来的省钱语义。
+   * 纯 tps 降序会把 0.05 倍率和 5 倍率混着排。链被切成 25 tok/s 一档：
    *
-   * 关键点：**「有数据」不等于「快」**。早期版本把两者混为一谈，结果一个被测出
-   * 20 秒的模型因为「有数据」反而压在没数据的模型前面——正好反了。
+   *   - **跨档**：吞吐高的档整档排在前面——用户要的「优先用快的」；
+   *   - **档内**：到期优先 → 倍率，保持原来「不浪费积分」的语义。
+   *
+   * 档宽固定而不是按百分位：百分位会让「全是 60 tok/s」的一批模型也硬分出
+   * 三六九等，而它们其实一样快，此时该由价格决定先谁。
+   *
+   * ## 什么算「快」
+   *
+   *   - 有 tps 数据且达标 → 进对应的吞吐档（0 档最快）；
+   *   - 没数据 / tps = 0（只思考未作答，测不出吞吐）→ 单独一档，排在有数据的
+   *     之后、「实测偏慢」之前。没测过既不能当快，也不能当慢；
+   *   - 实测慢（首字超 `slowTtfbMs` 或吞吐低于 `minTokensPerSecond`）→ 最后。
+   *
+   * 淘汰发生在更前面（`excludeBelowTps`），慢到被淘汰的模型**根本不会走到这里**。
    */
-  const makeSpeedAware = options => {
+  const makeThroughputFirst = options => {
     const cache = new Map()
     const slowTtfb = positive(options.slowTtfbMs, DEFAULTS.slowTtfbMs)
     const minTps = positive(options.minTokensPerSecond, DEFAULTS.minTokensPerSecond)
-    /**
-     * 「整轮耗时」估算用的预期输出量。
-     *
-     * 用户关心的是「问完到答案写完」的总时间，不是首字。所以排序键从
-     * `ttfb` 换成 `ttfb + expected / tps`：吞吐高的模型即使在首字上吃点亏，
-     * 也会因为生成段更快而整体更早写完。`preferThroughput` 关掉时退回只看首字。
-     */
     const expected = positive(options.expectedOutputTokens, DEFAULTS.expectedOutputTokens)
     const useTotal = options.preferThroughput !== false
-    /** 0 = 实测快；1 = 无数据；2 = 实测慢。 */
+    /**
+     * 一档 25 tok/s：大约「差一倍体感」的粒度。0 = 不分档（严格按 tps 降序）。
+     *
+     * 注意这里**不能**用 `positive()` 兜底：`positive(0, 25)` 会得到 25，
+     * 于是「0 = 不分档」这个约定永远不生效——用户把档宽填 0 却还是被分档，
+     * 属于典型的「配置项看着生效、其实没生效」。
+     */
+    const bandRaw = Number(options.throughputBandTps)
+    const bandWidth = Number.isFinite(bandRaw) && bandRaw > 0 ? bandRaw : 0
+    /**
+     * 分类结果：
+     *
+     *   `rank` 0 = 有吞吐数据（`band` 越小越快）；1 = 没有可比数据；2 = 实测慢。
+     */
     const classOf = row => {
       if (cache.has(row.id)) return cache.get(row.id)
       const value = options.preferMeasuredSpeed === false
         ? { rank: 1 }
         : (() => {
           const s = speedOf(row.id, { speedMemoryMinutes: options.speedMemoryMinutes })
-          if (s === undefined || !Number.isFinite(s.ttfb)) return { rank: 1 }
-          const slow = (slowTtfb > 0 && s.ttfb > slowTtfb)
-            || (minTps > 0 && Number.isFinite(s.tps) && s.tps > 0 && s.tps < minTps)
+          if (s === undefined) return { rank: 1 }
+          const tps = Number(s.tps)
+          const hasTps = Number.isFinite(tps) && tps > 0
           /**
-           * 合计耗时：首字 + 生成预期量所需时间。
-           *
-           * 没有吞吐数据时**不能**当作无限（那会把所有无 tps 的模型一脚踢到
-           * 最后），退回只看首字；有数据才把生成段计入。
+           * 「实测慢」的判据与请求期一致：首字太慢，或吞吐低于请求期门槛。
+           * 注意**不能**把「没有 tps」当慢——只思考未作答的模型会因此被误杀。
            */
-          const gen = useTotal && Number.isFinite(s.tps) && s.tps > 0 ? expected / s.tps * 1000 : 0
-          return { rank: slow ? 2 : 0, ttfb: s.ttfb, total: s.ttfb + gen }
+          const slow = (slowTtfb > 0 && Number.isFinite(s.ttfb) && s.ttfb > slowTtfb)
+            || (hasTps && minTps > 0 && tps < minTps)
+          if (!hasTps) {
+            /**
+             * 没有吞吐数据（或 tps=0）。首字快的那批仍值得排在后面之前：
+             * 它们至少证明了「能很快开始作答」。
+             */
+            return slow ? { rank: 2, ttfb: s.ttfb } : { rank: 1, ttfb: s.ttfb }
+          }
+          /**
+           * 合计耗时只作为**同档内**的细分：吞吐已由 band 表达，这里用
+           * `首字 + 预期输出/吞吐` 处理「同档但一个首字 0.5s、一个 4s」。
+           */
+          const gen = useTotal ? expected / tps * 1000 : 0
+          return {
+            rank: slow ? 2 : 0,
+            /**
+             * 分档越高越慢，所以要**降序**比较。`bandWidth = 0` 时给 0，
+             * 于是「跨档」这一步恒不触发，退化成严格按 tps 排。
+             */
+            band: bandWidth > 0 ? Math.floor(tps / bandWidth) : 0,
+            tps,
+            total: (Number.isFinite(s.ttfb) ? s.ttfb : 0) + gen,
+          }
         })()
       cache.set(row.id, value)
       return value
@@ -889,16 +1214,66 @@ export function buildTiers(rows, config) {
       const ca = classOf(a)
       const cb = classOf(b)
       if (ca.rank !== cb.rank) return ca.rank - cb.rank
-      // 同一档且都有快数据：按合计耗时（吞吐优先）再按首字。
+      /**
+       * 跨档：吞吐高的档（`band` 小）整档在前。
+       *
+       * **必须降序**：`Math.floor(tps / width)` 是「越大越快、档号越小」，
+       * 写成升序会把最慢的模型排到第一条——这是分档排序唯一容易写反的地方。
+       */
+      if (ca.rank === 0 && ca.band !== cb.band) return cb.band - ca.band
+      /**
+       * ## 为什么这里**不能**留容差
+       *
+       * 早期写的是 `if (Math.abs(diff) > 1) return diff`——想让毫秒级的抖动
+       * 不影响排序。但那会让比较器**不满足传递性**：A 比 B 快 0.5ms（判相等，
+       * 落到下一个键）、B 比 C 快 0.5ms（同样判相等），而 A 比 C 快 1.5ms
+       * （这次返回了差值）。于是「A<B、B<C，但 A>C」——排序结果取决于
+       * V8 内部取了哪几对，链的顺序会莫名其妙地乱掉。
+       *
+       * 正确做法：**所有键都严格比较，最后一定回落到 id**，保证比较器是一个
+       * 全序。抖动交给中位数与时间窗口去吸收，不靠比较器放水。
+       */
       if (ca.rank === 0 && Number.isFinite(ca.total) && Number.isFinite(cb.total)) {
         const diff = ca.total - cb.total
-        if (Math.abs(diff) > 1) return diff
+        if (diff !== 0) return diff
       }
-      if (ca.rank === 0 && Number.isFinite(ca.ttfb) && Number.isFinite(cb.ttfb)) {
+      // 没有吞吐数据：首字快的在前（同样只是同档内细分）。
+      if (ca.rank !== 2 && Number.isFinite(ca.ttfb) && Number.isFinite(cb.ttfb)) {
         const diff = ca.ttfb - cb.ttfb
         if (diff !== 0) return diff
       }
       return byExpiryThenRate(a, b)
+    }
+  }
+
+  /**
+   * 是否该把这个模型**淘汰出所有链**。
+   *
+   * 判据只有一条：**实测**证明它慢。
+   *
+   *   - 速度画像里的吞吐低于 `excludeBelowTps`；
+   *   - 或者它已经被请求期判成「慢模型」（`slowModels`，且仍在记忆窗口内）。
+   *
+   * 绝不因为「没有数据」淘汰：启动瞬间所有模型都还没测过，按「没数据就淘汰」
+   * 会得到一条空链。这也意味着第一次启动时淘汰不生效——测完一轮才生效，
+   * 而那正是用户要的「重测全部之后按结果挑」。
+   */
+  const makeDropped = options => {
+    const cut = Number(options.excludeBelowTps)
+    const cache = new Map()
+    return row => {
+      if (!Number.isFinite(cut) || cut <= 0) return false
+      if (cache.has(row.id)) return cache.get(row.id)
+      const s = speedOf(row.id, { speedMemoryMinutes: options.speedMemoryMinutes })
+      const tps = Number(s?.tps)
+      let drop = false
+      if (Number.isFinite(tps) && tps > 0 && tps < cut) drop = true
+      else if (tps === 0 && isSlow(row.id, { slowMemoryMinutes: options.slowMemoryMinutes })) {
+        // tps = 0 且被标慢：只思考不回答、或请求期直接超时——两种都不该进链。
+        drop = true
+      }
+      cache.set(row.id, drop)
+      return drop
     }
   }
 
@@ -973,24 +1348,74 @@ export function buildTiers(rows, config) {
    * 两者都算「免费」，把不会过期的放在前面更稳。
    */
   /**
-   * 排序器：实测快的优先。
+   * 排序器：**吞吐降序**（用户新规则）。
    *
    * `cap` 之前排序，让「该进链的模型」的**顺序**就是它们进链的顺序——
-   * 实测快的先被选中，也排在最前。这与慢模型降级（`cap` 之后）配合：
-   * 先按速度排出理想顺序，再把已知慢的挪到末尾。
+   * 吞吐高的先被选中，也排在最前。这与慢模型降级（`cap` 之后）配合：
+   * 先按吞吐排出理想顺序，再把已知慢的挪到末尾。
    */
-  const bySpeed = makeSpeedAware({
+  const bySpeed = makeThroughputFirst({
     speedMemoryMinutes: config.speedMemoryMinutes,
     preferMeasuredSpeed: config.preferMeasuredSpeed,
     preferThroughput: config.preferThroughput,
     expectedOutputTokens: config.expectedOutputTokens,
     slowTtfbMs: config.slowTtfbMs,
     minTokensPerSecond: config.minTokensPerSecond,
+    throughputBandTps: config.throughputBandTps,
   })
-  const freeOrdered = [
-    ...free.filter(row => !QUOTA_PROVIDERS.has(row.provider)).sort(bySpeed),
-    ...free.filter(row => QUOTA_PROVIDERS.has(row.provider)).sort(bySpeed),
-  ]
+  const dropped = makeDropped({
+    speedMemoryMinutes: config.speedMemoryMinutes,
+    slowMemoryMinutes: config.slowMemoryMinutes,
+    excludeBelowTps: config.excludeBelowTps,
+  })
+  /**
+   * 淘汰 + 排序，一步到位。
+   *
+   * 淘汰放在**最前面**（`cap` 之前），这样被淘汰的模型不会占掉 `maxLinks` /
+   * `perProviderLinks` 的名额——否则「淘汰 5 个慢的」反而会把名额浪费在它们
+   * 身上，链里剩下的成员数不变但可用性更差。
+   */
+  const pickUsable = list => (Array.isArray(list) ? list : []).filter(row => !dropped(row)).sort(bySpeed)
+
+  /**
+   * 免费层内部：真 0 积分优先，每日额度渠道排后。
+   *
+   * ## 这条偏好只在**同档内**生效
+   *
+   * 每日额度当天不用就清零，但它每天都会刷新；真 0 积分不消耗任何额度。
+   * 所以在「吞吐差不多」时，把不会过期的放前面更划算。
+   *
+   * 但它**绝不能**压过吞吐：早先的实现是把免费链整个切成「非额度渠道 +
+   * 额度渠道」两段，于是 `zcode/GLM-5.3`（103 tok/s）会排在
+   * `codearts/deepseek-v4.1-flash`（86 tok/s）之后——虽然前者更快。用户的
+   * 新规则是「吞吐从大到小」，额度偏好只能在档内做次要键。
+   */
+  const quotaRank = row => (QUOTA_PROVIDERS.has(row.provider) ? 1 : 0)
+  /**
+   * 免费链的排序器：吞吐为主键（与其它链完全一致），额度渠道作为**同档内**
+   * 的次要键——比倍率更靠后，因为免费层里「省额度」不如「不浪费会作废的」。
+   */
+  const bySpeedWithQuota = (a, b) => {
+    const rank = quotaRank(a) - quotaRank(b)
+    const primary = bySpeed(a, b)
+    /**
+     * 只有两者落在**同一个吞吐档**时才让额度偏好插队。
+     *
+     * `bySpeed` 的内部状态拿不到，所以用 tps 的档号自己算一遍：同档 = 同
+     * 「快慢级别」，此时让额度偏好生效不会推翻吞吐语义。
+     */
+    const bandOf = r => {
+      const tps = throughputOf(r.id, config.speedMemoryMinutes)
+      const width = Number(config.throughputBandTps)
+      if (tps === undefined) return -1
+      return Number.isFinite(width) && width > 0 ? Math.floor(tps / width) : tps
+    }
+    const ba = bandOf(a)
+    const bb = bandOf(b)
+    if (ba === bb && rank !== 0) return rank
+    return primary
+  }
+  const freeOrdered = pickUsable(free).sort(bySpeedWithQuota)
 
   const cap = list => {
     const seen = new Map()
@@ -1008,11 +1433,33 @@ export function buildTiers(rows, config) {
   /**
    * 慢模型沉到链尾。
    *
-   * 放在 `cap` **之后**：先按到期/倍率挑出该进链的模型，再把其中实测偏慢的
-   * 挪到末尾。反过来（先降级再截断）会让慢模型因为被挤到链尾而刚好被截掉，
-   * 等于「一次慢就永久出局」——比用户要的「排到最后面」更狠。
+   * 放在 `cap` **之后**：先按 throughput/到期/倍率挑出该进链的模型，再把其中
+   * 实测偏慢的挪到末尾。
+   *
+   * ## 为什么「有达标吞吐」的模型不做降级
+   *
+   * `slowModels` 有两种来源：**请求期**判慢（某一次流得很慢/超时）与**探测期**
+   * 判慢。前者是单次事件的证据，后者是专门的测速结果——两者冲突时当然信后者。
+   *
+   * 实测踩到的反例：`qodercn/dfmodel` 实测 **160 tok/s**（全池最快），但因为
+   * 历史上某次请求头字慢被记了 `isSlow`，于是排序完又被打回链尾，链首变成了
+   * 77 tok/s 的模型。用户要的是「吞吐从大到小」，这正好反了。
+   *
+   * 所以：**有达标吞吐就不降级**，并顺手清掉那条过期的慢记录。
    */
-  const demote = list => demoteSlow(list, { slowMemoryMinutes: config.slowMemoryMinutes })
+  const demote = list => {
+    const minTps = positive(config.minTokensPerSecond, DEFAULTS.minTokensPerSecond)
+    const out = []
+    for (const row of Array.isArray(list) ? list : []) {
+      const tps = throughputOf(row.id, config.speedMemoryMinutes)
+      if (tps !== undefined && minTps > 0 && tps >= minTps && isSlow(row.id, { slowMemoryMinutes: config.slowMemoryMinutes })) {
+        // 实测达标而记录说它慢：以实测为准，清掉过期记录。
+        markFast(row.id)
+      }
+      out.push(row)
+    }
+    return demoteSlow(out, { slowMemoryMinutes: config.slowMemoryMinutes })
+  }
 
   /**
    * 是否对某条链应用 `cap()`。
@@ -1032,14 +1479,17 @@ export function buildTiers(rows, config) {
 
   return {
     free: demote(freeCap(freeOrdered)),
-    low: demote(lowCap(low.slice().sort(bySpeed))),
-    high: demote(highCap(high.slice().sort(bySpeed))),
+    low: demote(lowCap(pickUsable(low))),
+    high: demote(highCap(pickUsable(high))),
     /**
-     * Custom 不 `cap`（用户在设置页勾了多少就该跑多少），但**要排序**：
-     * auto 模式下它是一整个池，按「整轮最快」排才能让吞吐大的模型先跑；
-     * explicit 模式下清单本身就是用户的意图，顺序按勾选顺序保留。
+     * Custom 不 `cap`（用户在设置页勾了多少就该跑多少），但**同样按吞吐降序**
+     * 排——用户的新规则是「4 个分类都按吞吐量从大到小排序」，Custom 不例外。
+     *
+     * 淘汰对 Custom **同样生效**：用户的原话是「低于 50 tok/s 的直接取消选择，
+     * 不进入组合模型」——手选的清单里也不该留着测出来只有 8 tok/s 的模型。
+     * 被淘汰的模型仍留在设置页的候选列表里（只是不进链），随时能取消阈值找回。
      */
-    custom: demote(customExplicit ? custom : custom.slice().sort(bySpeed)),
+    custom: demote(pickUsable(custom)),
   }
 }
 
@@ -1125,22 +1575,46 @@ export function candidatesFor(list, messages) {
  * 轮换起点：每次调用把游标前移一位，返回一个「从该位开始、绕回开头」的
  * 旋转副本。
  *
- * 为什么不打乱顺序：链的语义是「前面的更该用」（到期优先、倍率优先）。
+ * 为什么不打乱顺序：链的语义是「前面的更该用」（吞吐优先、其次到期/倍率）。
  * 轮换只改变**从哪一位开始**，不改变优先级次序，所以第 N 次调用会从第 N
- * 个候选起试，失败仍按原顺序往后走——既分散了用量，又保留了省钱顺序。
+ * 个候选起试，失败仍按原顺序往后走——既分散了用量，又保留了「快和省」的顺序。
  *
- * 游标按 `model`（链 id）分开记，三条链互不干扰。纯内存状态：重启后从头
+ * ## 只在前 `band` 个里轮换（用户新规则的关键）
+ *
+ * 用户要的是「能用到速度快的，也能在模型之间把大部分账号都用到，不至于集中
+ * 使用几个模型」。两条诉求同时满足的唯一方式是**把轮换限制在一个小窗口里**：
+ *
+ *   - 窗口 = 吞吐最高的前 `band` 个（`fastBandSize`）；
+ *   - 窗口内轮流当链首 → 用量分散，但每个都是快的；
+ *   - 窗口外原样接在后面 → 窗口内全失败时仍能降级，可用性不降。
+ *
+ * 整条链轮流是**错的**：那会让一个排在第 30 位、实测 8 tok/s 的模型偶尔当
+ * 链首，用户为「分散用量」付一次十几秒的代价。窗口轮换把「分散」限制在
+ * 「都够快」的集合里。
+ *
+ * 游标按 `model`（链 id）分开记，四条链互不干扰。纯内存状态：重启后从头
  * 开始，代价只是用量分布重新洗牌，不影响正确性。
  */
 const rotationCursor = new Map()
 
-export function rotate(list, key) {
+export function rotate(list, key, band = 0) {
   const rows = Array.isArray(list) ? list : []
   if (rows.length <= 1) return rows
   const id = String(key ?? '')
-  const start = (rotationCursor.get(id) ?? 0) % rows.length
-  rotationCursor.set(id, (start + 1) % rows.length)
-  return [...rows.slice(start), ...rows.slice(0, start)]
+  /**
+   * 轮换窗口大小。
+   *
+   * `band <= 0` 或 `band >= length` 时退回「整条链轮换」——这是老行为，
+   * 保留它是为了让单测与「关了快速档」的场景语义不变。
+   */
+  const size = Number.isFinite(band) && band > 1 ? Math.min(Math.trunc(band), rows.length) : rows.length
+  const start = (rotationCursor.get(id) ?? 0) % size
+  rotationCursor.set(id, (start + 1) % size)
+  if (size === rows.length) return [...rows.slice(start), ...rows.slice(0, start)]
+  // 窗口内旋转，窗口外原样接在后面。
+  const inside = rows.slice(0, size)
+  const outside = rows.slice(size)
+  return [...inside.slice(start), ...inside.slice(0, start), ...outside]
 }
 
 /** 测试缝：轮换游标是进程状态。 */
@@ -1234,7 +1708,20 @@ export function restoreSpeedMemory() {
     if (entry === null || typeof entry !== 'object') continue
     const at = Number(entry.at)
     if (!Number.isFinite(at) || now - at > MEMORY_RESTORE_MAX_AGE_MS) continue
-    const samples = Array.isArray(entry.samples) ? entry.samples.slice(-8) : []
+    /**
+     * 恢复时也要夹掉不可能的吞吐。
+     *
+     * `recordSpeed` 已经夹过一次，但落盘文件可能来自**加这道闸之前**的版本
+     * （实测有一份 55666 tok/s 的样本就这么存下来了）。只写不读地加闸，等于
+     * 老数据永远污染排序——所以读回来的路径也要过同一道闸。
+     */
+    const samples = (Array.isArray(entry.samples) ? entry.samples.slice(-8) : [])
+      .map(sample => {
+        const tps = Number(sample?.tps)
+        return Number.isFinite(tps) && tps > MAX_PLAUSIBLE_TPS
+          ? { ...sample, tps: MAX_PLAUSIBLE_TPS }
+          : sample
+      })
     if (samples.length === 0) continue
     speedProfiles.set(id, { samples, at })
   }
@@ -1258,6 +1745,26 @@ const speedProfiles = new Map()
 const slowModels = new Map()
 
 /**
+ * 吞吐的物理上限（tokens/s）。
+ *
+ * ## 为什么必须夹一刀
+ *
+ * 探测用「字符数 / 耗时」估算吞吐，样本很短时这个比值会失控。实测数据里有
+ * 一条 `codearts/glm-5.3-flash` 记到了 **55666 tok/s**：那是「26 个字符在
+ * 不到 1 毫秒内到达」的结果——上游把整段回答一次性推了过来，首字与末字之间
+ * 几乎没有间隔。
+ *
+ * 这个数字一旦进入排序会带来两个真实后果：
+ *
+ *   1. 它所在的分档 2200+ 会顶掉所有正常模型，链首永远是它；
+ *   2. 「快速档前 3 个」被这类虚高样本占满，真正的 100 tok/s 模型反而进不去。
+ *
+ * 2000 tok/s 远高于任何真实模型（人类阅读速度约 8，正常 LLM 输出 50–300），
+ * 又足够高到不误伤「真的很快」的样本。
+ */
+export const MAX_PLAUSIBLE_TPS = 2000
+
+/**
  * 记录一次实测速度。
  *
  * @param {string} modelId
@@ -1266,8 +1773,16 @@ const slowModels = new Map()
 export function recordSpeed(modelId, sample) {
   const id = String(modelId ?? '')
   if (id === '') return
+  /**
+   * 夹掉不可能的吞吐值。
+   *
+   * 不丢弃整个样本（首字延迟仍然有效），只把 `tps` 裁到物理上限——这样
+   * 「快得不真实」的样本既不会污染排序，也不会让首字数据跟着丢。
+   */
+  const raw = Number(sample?.tps)
+  const tps = Number.isFinite(raw) && raw > MAX_PLAUSIBLE_TPS ? MAX_PLAUSIBLE_TPS : sample?.tps
   const previous = speedProfiles.get(id) ?? { samples: [], at: 0 }
-  const next = { samples: [...previous.samples, sample].slice(-8), at: Date.now() }
+  const next = { samples: [...previous.samples, { ...sample, tps }].slice(-8), at: Date.now() }
   speedProfiles.set(id, next)
   scheduleMemoryFlush()
 }
@@ -1358,6 +1873,63 @@ export function demoteSlow(list, options = {}) {
   return [...fast, ...slow]
 }
 
+/** 某个模型当前的有效吞吐（tokens/s）；没有数据返回 undefined。 */
+export function throughputOf(modelId, speedMemoryMinutes) {
+  const s = speedOf(modelId, { speedMemoryMinutes })
+  const tps = Number(s?.tps)
+  return Number.isFinite(tps) && tps > 0 ? tps : undefined
+}
+
+/**
+ * 逐个模型判断「是否该被淘汰出链」，剔除掉链里不该出现的成员。
+ *
+ * 与 `buildTiers` 里的 `makeDropped` 是**同一判据的两份实现**：一份在分层时用
+ * （闭包里带缓存，一次算一条链），一份在请求时用（只看本轮候选）。
+ * 为什么不共用一个：分层那版活在一个闭包里、持有那条链的缓存，而请求路径要
+ * 用**最新**的速度画像——分层可能已经过去 30 分钟，中间又有新样本。
+ *
+ * @param {Array<object>} list
+ * @param {{excludeBelowTps?:number, speedMemoryMinutes?:number, slowMemoryMinutes?:number}} options
+ * @returns {Array<object>} 未被淘汰的候选，顺序不变
+ */
+export function filterDropped(list, options = {}) {
+  const rows = Array.isArray(list) ? list : []
+  const cut = Number(options.excludeBelowTps)
+  if (!Number.isFinite(cut) || cut <= 0) return rows
+  return rows.filter(row => {
+    const s = speedOf(row.id, { speedMemoryMinutes: options.speedMemoryMinutes })
+    const tps = Number(s?.tps)
+    if (Number.isFinite(tps) && tps > 0) return tps >= cut
+    // 没有吞吐数据：只有「被请求期判慢」的才淘汰，没测过的一律留下。
+    if (tps === 0) return !isSlow(row.id, { slowMemoryMinutes: options.slowMemoryMinutes })
+    return true
+  })
+}
+
+/**
+ * 一次「淘汰 + 按吞吐降序」的纯函数封装，供设置页的预览榜使用。
+ *
+ * 分离出来是为了让「设置页显示的榜」与「链里实际的顺序」用**同一套判据**：
+ * 两处各写一份，迟早会漂移成「页面说它第一、实际排第三」。
+ *
+ * 与 `buildTiers` 的差别只在「分档」：这里给出的是**严格按吞吐降序**的直觉榜，
+ * 便于用户一眼看出谁最快；`buildTiers` 再把它切成档、档内按价格排。
+ */
+export function rankCandidates(list, options = {}) {
+  const usable = filterDropped(Array.isArray(list) ? list : [], options)
+  const speedMemoryMinutes = options.speedMemoryMinutes
+  return usable.slice().sort((a, b) => {
+    const ta = throughputOf(a.id, speedMemoryMinutes)
+    const tb = throughputOf(b.id, speedMemoryMinutes)
+    if (ta !== tb) {
+      if (ta === undefined) return 1
+      if (tb === undefined) return -1
+      return tb - ta
+    }
+    return String(a.id).localeCompare(String(b.id))
+  })
+}
+
 /**
  * 判定速度所需的最少正文字符数。
  *
@@ -1445,6 +2017,28 @@ export const PROBE_JITTER_MS = [200, 500]
  * 那种模型正是用户最想在列表里一眼认出来的。
  */
 export const PROBE_TIMEOUT_MS = 12_000
+
+/**
+ * 这次探测失败，算不算「这个模型慢」？
+ *
+ * 只把**速度/产出**类的失败算进来：
+ *
+ *   - 超时（`超时（12s）`）：连最小请求都等不到——最典型的「慢」；
+ *   - 空响应 / 流提前结束：上游答应给了却不产出，实际用起来等于卡死；
+ *   - 只思考不回答被当成成功处理（见 `probeModel`），不在这里。
+ *
+ * **不算**的是 `HTTP 4xx/5xx`：那是「请求或服务的问题」，不是「速度问题」。
+ * 把它们也记成慢，会让一次网关抖动把一堆本来很快的模型永久踢出候选——这
+ * 正是「淘汰」这个功能最危险的误伤方式。
+ */
+export function isSpeedFailure(error) {
+  const text = String(error ?? '')
+  if (text === '') return false
+  if (/^超时/.test(text)) return true
+  if (/空响应/.test(text)) return true
+  if (/流提前结束/.test(text)) return true
+  return false
+}
 
 /**
  * 速度探测的运行态。
@@ -1692,6 +2286,16 @@ export async function runProbe(deps) {
       const result = await probeModel(row.id, { base, key })
       if (result.ok) {
         recordSpeed(row.id, { ttfb: result.ttfb, tps: result.tps })
+        /**
+         * 「测出来了、而且够快」就清掉慢记录。
+         *
+         * 不清的话，一个昨天被请求期判慢的模型即使今天测出 120 tok/s，仍会
+         * 因为 `isSlow` 为真而被 `filterDropped` 挡在链外——「重测全部」就
+         * 失去了「重新证明自己」的意义。
+         */
+        if (Number(result.tps) > 0 && Number(result.tps) >= positive(config.minTokensPerSecond, DEFAULTS.minTokensPerSecond)) {
+          markFast(row.id)
+        }
       } else {
         /**
          * 失败也记一笔「很慢」。
@@ -1701,6 +2305,19 @@ export async function runProbe(deps) {
          * 不再浪费一次完整请求的时间。
          */
         recordSpeed(row.id, { ttfb: PROBE_TIMEOUT_MS, tps: 0 })
+        /**
+         * **速度类**失败才记「慢」，HTTP 4xx 不算。
+         *
+         * 这个区别决定了它会不会被「吞吐淘汰」摘掉：超时 / 空响应 / 只思考
+         * 不回答是「这个模型干活不行」，该淘汰；而 `HTTP 400` 多半是请求形状
+         * 或该模型不支持这套参数——那不是慢，换个参数就能用，把它淘汰掉是
+         * 误伤。
+         */
+        if (isSpeedFailure(result.error)) {
+          markSlow(row.id)
+        } else {
+          markFast(row.id)
+        }
       }
       probeState.done += 1
       try { onProgress?.(probeState.done, probeState.total) } catch { /* 回报失败不影响探测 */ }
@@ -1737,6 +2354,12 @@ export async function runProbe(deps) {
 }
 
 // ── 积分汇总 ────────────────────────────────────────────────────────────────
+
+/** 是否至少有一个渠道拿到了逐账号余额（账号排序的前提）。 */
+function hasAccountBalances(accounts) {
+  if (accounts === null || typeof accounts !== 'object') return false
+  return Object.values(accounts).some(list => Array.isArray(list) && list.length > 0)
+}
 
 /**
  * 把逐渠道的积分汇总成一个总数。
@@ -2202,8 +2825,17 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  async function channelRpc(method, payload, timeoutMs = 30000) {
-    if (config.expiryLookup === false) throw new Error('已在设置里关闭到期查询')
+  /**
+   * 调渠道包的 RPC。
+   *
+   * `opts.requiresExpiryLookup`（默认 true）：这是针对**积分**的调用，用户把
+   * 「查询积分余额」关掉时就不该再发。账号重排是另一件事（它读的是同一份余额
+   * 数据，但目的不是展示积分），由调用方显式关掉这个前置检查。
+   */
+  async function channelRpc(method, payload, timeoutMs = 30000, opts = {}) {
+    if (opts.requiresExpiryLookup !== false && config.expiryLookup === false) {
+      throw new Error('已在设置里关闭到期查询')
+    }
     const secret = readSessionSecret()
     if (secret === undefined) throw new Error('读不到会话密钥（~/.dsh/.credentials.yaml）')
     const port = webPort.value
@@ -2235,6 +2867,88 @@ export function apply(ctx, rawConfig) {
     } finally {
       clearTimeout(timer)
     }
+  }
+
+  /**
+   * 上一次账号重排的时刻（毫秒）。节流用：`accountReorderMinutes`。
+   * 按渠道记，因为不同渠道的账号变化节奏不同。
+   */
+  const accountReorderAt = new Map()
+  /** 最近一次账号重排的结果，供设置页展示。 */
+  let accountPlan = { at: 0, providers: {}, skipped: [] }
+
+  /**
+   * 把「先用快到期的账号、其余轮流」落到渠道包的**真实选号顺序**上。
+   *
+   * ## 为什么必须写回渠道包
+   *
+   * 渠道包选号用的是「账号数组里第一个可用账号」（见它自己的
+   * `getAvailableAccount`），本插件拿不到那个数组。所以「优先用快到期的账号」
+   * 只有一条路能真正生效：读出账号与其积分到期时间 → 算出目标顺序 → 用
+   * `account.reorder` 写回去。写回之后，**每次请求**的选号都按新顺序走，
+   * 包括渠道包自己的换号重试。
+   *
+   * ## 为什么是节流的
+   *
+   * `account.reorder` 要写一次渠道包的设置文件。每次 30 分钟的分层都写，
+   * 既无必要（到期时间以天为单位变化），也让「顺序」变得不可观察。
+   * 默认 10 分钟一次足够。
+   *
+   * ## 失败即降级
+   *
+   * 任何一步失败（渠道包没装、RPC 不通、账号列表变了）都只记日志，不影响
+   * 分层与调用。这是可选增强，不是依赖。
+   */
+  async function reorderAccounts(accountsByProvider) {
+    if (config.accountExpiryFirst === false && config.accountRotation === false) return
+    const throttleMs = Math.max(0, Number(config.accountReorderMinutes) || 0) * 60_000
+    const now = Date.now()
+    const next = { at: now, providers: {}, skipped: [] }
+
+    for (const [provider, balances] of Object.entries(accountsByProvider ?? {})) {
+      const last = accountReorderAt.get(provider) ?? 0
+      if (throttleMs > 0 && now - last < throttleMs) { next.skipped.push(`${provider}: 节流中`); continue }
+      let accounts
+      try {
+        const value = await channelRpc('account.list', { provider }, 20_000, { requiresExpiryLookup: false })
+        accounts = Array.isArray(value?.accounts) ? value.accounts : []
+      } catch (error) {
+        next.skipped.push(`${provider}: ${String(error?.message ?? error).slice(0, 60)}`)
+        continue
+      }
+      if (accounts.length <= 1) { next.skipped.push(`${provider}: 只有一个账号`); continue }
+
+      const plan = planAccountOrder({
+        provider, accounts, balances,
+        options: {
+          expiryFirst: config.accountExpiryFirst !== false,
+          rotation: config.accountRotation !== false,
+          windowDays: config.expiringWindowDays,
+        },
+      })
+      /**
+       * 顺序没变就不写。
+       *
+       * `reorder` 会落盘并记一条日志；每轮都写同一种顺序会把日志灌满，也让
+       * 「最近一次重排」这个时间戳失去意义。
+       */
+      const current = accounts.map(account => String(account?.id ?? ''))
+      if (plan.ordered.length === current.length && plan.ordered.every((id, i) => id === current[i])) {
+        accountReorderAt.set(provider, now)
+        next.providers[provider] = { order: plan.ordered, changed: false, expiring: plan.expiring }
+        continue
+      }
+      try {
+        await channelRpc('account.reorder', { provider, orderedIds: plan.ordered }, 20_000, { requiresExpiryLookup: false })
+        accountReorderAt.set(provider, now)
+        next.providers[provider] = { order: plan.ordered, changed: true, expiring: plan.expiring }
+        log(`账号顺序已更新（${provider}）：先到期 ${plan.expiring.length} 个，其余轮换起点 ${plan.cursor}`)
+      } catch (error) {
+        next.skipped.push(`${provider}: ${String(error?.message ?? error).slice(0, 60)}`)
+      }
+    }
+    accountPlan = next
+    return next
   }
 
   async function refresh() {
@@ -2270,6 +2984,14 @@ export function apply(ctx, rawConfig) {
       total: fetched.rows.length,
       /** 四条链去重后的候选数——「目前有多少个模型可以调用」。 */
       callable: countCallable(tiers),
+      /**
+       * 本轮因「实测吞吐低于淘汰线」而被移出所有链的模型数。
+       *
+       * 显示它是为了让淘汰**可见**：用户看到的模型数会比候选池少，如果没有
+       * 这个数字，看起来就像「一堆模型凭空不见了」。具体名单在 `/config` 的
+       * `dropped` 里。
+       */
+      dropped: droppedSnapshot().length,
       credits: status.credits,
       expiryKnown: expiryState.annotated.length,
       expiryUnknown: expiryState.skipped.length,
@@ -2335,6 +3057,19 @@ export function apply(ctx, rawConfig) {
         log(fresh
           ? `积分到期：${result.annotated.length} 个渠道已知，${result.skipped.length} 个未知（未知的按中间优先级处理）`
           : `本轮余额全部查询失败（${result.skipped.length} 个渠道），沿用上一轮的数值`)
+        /**
+         * 账号级排序：把「快到期优先 + 其余轮换」落到渠道包的真实选号顺序。
+         *
+         * 只在这一轮**拿到了逐账号余额**时才做：没有余额就分不出「谁的积分先
+         * 作废」，硬排只会按 id 乱转，比不排更糟（会把用户手排的顺序冲掉）。
+         *
+         * 不 await：它要挨个渠道发 RPC 并写盘，不该拖住 refresh 的返回。
+         */
+        if (fresh && hasAccountBalances(result.accounts)
+          && (config.accountExpiryFirst !== false || config.accountRotation !== false)) {
+          void reorderAccounts(result.accounts).catch(error =>
+            logger.warn?.(`[baipiao] 账号顺序重排失败（不影响调用）：${String(error?.message ?? error)}`))
+        }
         try { ctx.emit('llm/adapters-updated') } catch { /* ignore */ }
       }).catch(error => {
         /*
@@ -2382,6 +3117,9 @@ export function apply(ctx, rawConfig) {
    *
    * `rate` 让用户看到费率，`speed` 让用户按实测速度挑模型。没测过的 `speed`
    * 为 `undefined`，页面显示「—」——那是「还没测」，不是「很慢」。
+   *
+   * `dropped` 明确告诉页面「这个模型被测出来低于淘汰线、因此不在任何链里」。
+   * 不传它的话，用户勾选时只会看到「勾了却不在链里」，没有任何解释。
    */
   const shape = row => ({
     id: row.id,
@@ -2389,6 +3127,11 @@ export function apply(ctx, rawConfig) {
     rate: row.rate ?? null,
     vision: row.vision === true,
     speed: speedOf(row.id, { speedMemoryMinutes: config.speedMemoryMinutes }),
+    dropped: filterDropped([row], {
+      excludeBelowTps: config.excludeBelowTps,
+      speedMemoryMinutes: config.speedMemoryMinutes,
+      slowMemoryMinutes: config.slowMemoryMinutes,
+    }).length === 0,
   })
 
   /**
@@ -2408,7 +3151,14 @@ export function apply(ctx, rawConfig) {
           rate: row.rate ?? null,
           vision: row.vision === true,
           expiring: row.expiringCredits,
+          /**
+           * 实测吞吐（tokens/s）。链的顺序就是按它降序排的，把它带回去，
+           * 用户才能在页面上核对「排第一的确实最快」。
+           */
+          tps: throughputOf(row.id, config.speedMemoryMinutes) ?? null,
         })),
+        /** 这条链的快速档大小（参与轮换的候选数）。 */
+        fastBand: Math.max(1, Math.trunc(Number(config.fastBandSize) || 1)),
         contextWindow: cap.contextWindow,
         vision: cap.anyVision,
         allVision: cap.vision,
@@ -2483,6 +3233,54 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * 被淘汰的模型清单（实测吞吐低于门槛）。
+   *
+   * 取的是**候选池**与**速度画像**的交集：只有「在池里、且测出来慢」的才值得
+   * 展示。链成员里本来就没有的（如上架前测过又下架的）不该出现在这里。
+   */
+  function droppedSnapshot() {
+    const cut = Number(config.excludeBelowTps)
+    if (!Number.isFinite(cut) || cut <= 0) return []
+    const out = []
+    for (const row of poolRows()) {
+      if (!filterDropped([row], {
+        excludeBelowTps: cut,
+        speedMemoryMinutes: config.speedMemoryMinutes,
+        slowMemoryMinutes: config.slowMemoryMinutes,
+      }).length) {
+        const speed = speedOf(row.id, { speedMemoryMinutes: config.speedMemoryMinutes })
+        out.push({ id: row.id, tps: Number.isFinite(Number(speed?.tps)) ? Number(speed.tps) : null })
+      }
+    }
+    // 最慢的排前面：用户想看的正是「哪些被砍了、有多慢」。
+    return out.sort((a, b) => (a.tps ?? 999) - (b.tps ?? 999))
+  }
+
+  /**
+   * 每条链的「快速档」：吞吐最高的前 N 个（真正参与轮换的那几个）。
+   *
+   * 用户要「能用到速度快的，也能分散到多个模型上」。页面上必须能看到这两个
+   * 数字——`size` 是轮换窗口，`links` 是窗口内的成员。看不到就只能猜链到底
+   * 会不会轮着用。
+   */
+  function fastBandSnapshot() {
+    const size = Math.max(1, Math.trunc(Number(config.fastBandSize) || 1))
+    const out = {}
+    for (const key of ['free', 'low', 'high', 'custom']) {
+      const list = tiers[key] ?? []
+      out[key] = {
+        size: Math.min(size, list.length),
+        links: list.slice(0, size).map(row => ({
+          id: row.id,
+          tps: throughputOf(row.id, config.speedMemoryMinutes) ?? null,
+          rate: row.rate ?? null,
+        })),
+      }
+    }
+    return out
+  }
+
   /** 设置页读到的配置视图；Key 只回「有没有」。 */
   function viewConfig() {
     return {
@@ -2502,6 +3300,14 @@ export function apply(ctx, rawConfig) {
       slowTtfbMs: config.slowTtfbMs,
       maxSlowSkips: config.maxSlowSkips,
       minTokensPerSecond: config.minTokensPerSecond,
+      excludeBelowTps: config.excludeBelowTps,
+      fastBandSize: config.fastBandSize,
+      throughputBandTps: config.throughputBandTps,
+      probeOnStartup: config.probeOnStartup !== false,
+      startupProbeSkipMinutes: config.startupProbeSkipMinutes,
+      accountExpiryFirst: config.accountExpiryFirst !== false,
+      accountRotation: config.accountRotation !== false,
+      accountReorderMinutes: config.accountReorderMinutes,
       speedSampleMs: config.speedSampleMs,
       slowMemoryMinutes: config.slowMemoryMinutes,
       speedMemoryMinutes: config.speedMemoryMinutes,
@@ -2511,6 +3317,18 @@ export function apply(ctx, rawConfig) {
       autoProbeOnRefresh: config.autoProbeOnRefresh !== false,
       slowModels: slowSnapshot(),
       speedProfiles: speedSnapshot({ speedMemoryMinutes: config.speedMemoryMinutes }),
+      /**
+       * **被淘汰**的模型：实测吞吐低于门槛，已从所有链里移除。
+       *
+       * 单独回传而不是让页面自己从 `speedProfiles` 里筛，是为了让「淘汰线」
+       * 只有一个权威来源——页面按同一份名单显示，不会出现「页面说淘汰了、
+       * 链里还在」。
+       */
+      dropped: droppedSnapshot(),
+      /** 每条链的「快速档」：真正参与轮换调用的那几个。 */
+      fastBand: fastBandSnapshot(),
+      /** 最近一次账号顺序重排的结果。 */
+      accountPlan,
       customModels: config.customModels,
       /** Custom 是「跟随池子」还是「严格按勾选」；页面据此决定候选基准。 */
       customMode: config.customMode === 'explicit' ? 'explicit' : 'auto',
@@ -2521,6 +3339,81 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+
+  /**
+   * 探测范围：**候选池里去重后的全部模型**。
+   *
+   * 抽成函数是因为三个入口都要它：设置页的「测速 / 重测全部」、启动时的
+   * 自动重测、以及将来的定时补充。三处各写一份必然漂移。
+   */
+  function probeTargets() {
+    const seen = new Set()
+    const list = []
+    for (const row of allRows) {
+      if (row.contextWindow < positive(config.longContextMin, DEFAULTS.longContextMin)) continue
+      if (row.rate !== undefined && row.rate > positive(config.absurdRate, DEFAULTS.absurdRate)) continue
+      const id = String(row.id ?? '').toLowerCase()
+      if (id === '' || seen.has(id)) continue
+      seen.add(id)
+      list.push({ id: row.id })
+    }
+    return list
+  }
+
+  /**
+   * 每次启动后自动跑一次「重测全部」。
+   *
+   * ## 用户的要求
+   *
+   * 「每次开启软件就自动运行一次重测全部」——这样链里的吞吐排序、以及
+   * 「低于 50 tok/s 的淘汰」在**当天第一次打开**时就是新鲜的，不用手动点。
+   *
+   * ## 为什么不会变成风控风险
+   *
+   * 探测本身已经按渠道分组、单账号串行、200–500ms 抖动（见 `runProbe`）：
+   * 同时对同一账号只有一个请求在飞，这与「开一堆并发打同一个账号」是两类流量。
+   * 另外这里还加了两道闸：
+   *
+   *   1. **上一轮测完不足 `startupProbeSkipMinutes` 就跳过**——反复开关软件
+   *      不会反复全量探测，那才是真正会被看出规律的形态；
+   *   2. 只在**首次分层成功之后**才启动，避免网关还没就绪时白测一堆超时。
+   *
+   * 探测在后台跑，不 await，不影响任何一次对话的延迟。
+   */
+  let startupProbeDone = false
+  function startStartupProbe() {
+    if (config.probeOnStartup === false) return
+    if (startupProbeDone) return
+    startupProbeDone = true
+    const skipMs = Math.max(0, Number(config.startupProbeSkipMinutes) || 0) * 60_000
+    const sinceLast = Date.now() - (probeState.finishedAt || 0)
+    if (skipMs > 0 && probeState.finishedAt > 0 && sinceLast < skipMs) {
+      log(`启动重测跳过：上一轮测速在 ${Math.round(sinceLast / 60_000)} 分钟前完成（窗口 ${Math.round(skipMs / 60_000)} 分钟）`)
+      return
+    }
+    const { key } = resolveGatewayKey(config.gatewayKey)
+    if (key === '') { log('启动重测跳过：没有网关 Key'); return }
+    const list = probeTargets()
+    if (list.length === 0) { log('启动重测跳过：候选池为空'); return }
+    const base = text(config.gatewayUrl) || DEFAULTS.gatewayUrl
+    log(`启动重测：${list.length} 个模型，后台进行`)
+    void runProbe({
+      list, base, key,
+      /**
+       * `force: true` 是「重测全部」的语义：连已有画像的也重测一遍，
+       * 否则启动这道闸对老用户永远不生效（画像全都有，等于什么都不测）。
+       */
+      force: true,
+      speedMemoryMinutes: config.speedMemoryMinutes,
+      onProgress: (done, total) => { if (done % 25 === 0 || done === total) log(`启动重测 ${done}/${total}`) },
+    }).then(result => {
+      if (result.started === true) {
+        log(`启动重测已开始（${result.total} 个模型）`)
+        return
+      }
+      log(`启动重测未开始：${result.reason ?? '未知原因'}`)
+    }).catch(error => logger.warn?.(`[baipiao] 启动重测失败（不影响调用）：${String(error?.message ?? error)}`))
+  }
 
   /**
    * 首次刷新 + 有界重试。
@@ -2550,6 +3443,15 @@ export function apply(ctx, rawConfig) {
        * 这正是实测踩到的——重启后网关晚一两秒就绪，分层空着等了 30 分钟。
        */
       bootAttempt = 0
+      /**
+       * 启动后延迟几秒再开始重测。
+       *
+       * 为什么不是立刻：`refresh` 刚结束，余额查询（异步）可能还在路上，
+       * 而探测本身要占用网关与上游账号。错开 5 秒能让启动阶段的三股流量
+       * （模型清单、余额、探测）不叠在一起——对风控更友好，也不影响分层。
+       */
+      const timer = setTimeout(() => { try { startStartupProbe() } catch { /* 探测失败不影响启动 */ } }, 5000)
+      timer.unref?.()
       return
     }
     const delay = BOOT_DELAYS[bootAttempt]
@@ -2728,30 +3630,40 @@ export function apply(ctx, rawConfig) {
      * 一旦有正文交给调用方就不再切换，否则两个模型的文字会拼在一起。
      * 思考增量不算正文——想了很久才撞配额墙正是最值得降级的情形。
      *
-     * 两个运行期调整（都不是静态分层能表达的）：
+     * 三个运行期调整（都不是静态分层能表达的）：
      *
      *   1. **带图片时只用能看图的候选**。图片是请求级属性，静态分层做不到；
      *      这里按本轮消息里有没有 image 块现算。
-     *   2. **同档内轮换起点**。同一优先级里如果永远从第一个开始，实际用量会
-     *      集中在头一两个模型上——用户明确要求「不要集中用一个」。轮换让同档
-     *      的模型轮流当链首，同时保留「前面失败就往后走」的降级语义。
+     *   2. **快速档内轮换起点**（`fastBandSize`）。永远从第一个开始会把用量全
+     *      压在链首；整条链轮换又会轮到很慢的模型。只在「吞吐最高的前 N 个」
+     *      里轮换，才是用户要的「用快的 + 不集中」。
+     *   3. **请求期再淘汰一次**。`markSlow` 在流结束时写入，而分层最快也要等
+     *      下一次 `refresh`（默认 30 分钟）；这中间用户还会被同一个慢模型反复
+     *      拖慢。请求时再过滤一遍让它**下一次请求就消失**。
      */
     stream(options) {
       const list = options.__chain ?? membersOf(options.model)
       const candidates = candidatesFor(list, options.messages)
       /**
+       * 请求期淘汰：与分层期同一判据（实测吞吐低于门槛），但不重新排序——
+       * 顺序已经是分层时按吞吐排好的，这里只把「刚刚才被证明慢」的摘掉。
+       */
+      const usable = filterDropped(candidates, {
+        speedMemoryMinutes: config.speedMemoryMinutes,
+        slowMemoryMinutes: config.slowMemoryMinutes,
+        excludeBelowTps: config.excludeBelowTps,
+      })
+      /**
        * 先把「实测慢」的候选沉到链尾，再决定起点。
        *
        * 为什么在请求时再降一次，而不是只依赖 `buildTiers` 里的那次：
-       * `markSlow` 在流结束时写入，而分层最快也要等到下一次 `refresh`
-       * （默认 30 分钟）。这中间用户还会被同一个慢模型反复拖慢——而这正是
-       * 最需要立刻生效的时刻。请求时降级让它**下一次请求就排到后面**。
-       *
+       * `markSlow` 在流结束时写入，而分层最快也要等到下一次 `refresh`。
        * 代价是每个请求多一次 O(候选数) 的分组，实测链长 ≤40，可忽略。
        */
-      const demoted = demoteSlow(candidates, { slowMemoryMinutes: config.slowMemoryMinutes })
-      // 四条链（含 custom）都用轮换：只改变起点，不改变优先级/选择顺序。
-      const ordered = rotate(demoted, options.model)
+      const demoted = demoteSlow(usable, { slowMemoryMinutes: config.slowMemoryMinutes })
+      const band = Math.trunc(Number(config.fastBandSize) || 0)
+      // 四条链（含 custom）都用快速档轮换：只改变起点，不改变优先级/选择顺序。
+      const ordered = rotate(demoted, options.model, band)
       return createChainStream({
         ctx, config, logger,
         list: ordered,
@@ -2821,7 +3733,7 @@ export function apply(ctx, rawConfig) {
       throw Object.assign(new Error('settings must be a JSON object'), { statusCode: 400 })
     }
     const next = { ...config }
-    const numeric = ['refreshMinutes', 'lowMaxRate', 'longContextMin', 'maxLinks', 'perProviderLinks', 'absurdRate', 'expiringWindowDays', 'firstTokenTimeoutMs', 'slowTtfbMs', 'maxSlowSkips', 'minTokensPerSecond', 'speedSampleMs', 'slowMemoryMinutes', 'speedMemoryMinutes', 'expectedOutputTokens']
+    const numeric = ['refreshMinutes', 'lowMaxRate', 'longContextMin', 'maxLinks', 'perProviderLinks', 'absurdRate', 'expiringWindowDays', 'firstTokenTimeoutMs', 'slowTtfbMs', 'maxSlowSkips', 'minTokensPerSecond', 'excludeBelowTps', 'fastBandSize', 'throughputBandTps', 'startupProbeSkipMinutes', 'accountReorderMinutes', 'speedSampleMs', 'slowMemoryMinutes', 'speedMemoryMinutes', 'expectedOutputTokens']
     for (const key of numeric) {
       if (!Object.hasOwn(patch, key)) continue
       const raw = patch[key]
@@ -2853,6 +3765,9 @@ export function apply(ctx, rawConfig) {
       next.customMode = mode
     }
     if (Object.hasOwn(patch, 'autoProbeOnRefresh')) next.autoProbeOnRefresh = patch.autoProbeOnRefresh === true
+    if (Object.hasOwn(patch, 'probeOnStartup')) next.probeOnStartup = patch.probeOnStartup === true
+    if (Object.hasOwn(patch, 'accountExpiryFirst')) next.accountExpiryFirst = patch.accountExpiryFirst === true
+    if (Object.hasOwn(patch, 'accountRotation')) next.accountRotation = patch.accountRotation === true
     if (Object.hasOwn(patch, 'primeUpstream')) next.primeUpstream = patch.primeUpstream === true
     // customModels 是字符串：用户用逗号/空格/分号分隔模型 id。保存前用 parse 归一化，
     // 让页面回显的是去重、小写后的规范形式。
@@ -2947,16 +3862,7 @@ export function apply(ctx, rawConfig) {
           const { key } = resolveGatewayKey(config.gatewayKey)
           if (key !== '' && config.autoProbeOnRefresh !== false) {
             const base = text(config.gatewayUrl) || DEFAULTS.gatewayUrl
-            const seen = new Set()
-            const list = []
-            for (const row of allRows) {
-              if (row.contextWindow < positive(config.longContextMin, DEFAULTS.longContextMin)) continue
-              if (row.rate !== undefined && row.rate > positive(config.absurdRate, DEFAULTS.absurdRate)) continue
-              const id = String(row.id ?? '').toLowerCase()
-              if (id === '' || seen.has(id)) continue
-              seen.add(id)
-              list.push({ id: row.id })
-            }
+            const list = probeTargets()
             void runProbe({
               list, base, key, force: false,
               speedMemoryMinutes: config.speedMemoryMinutes,
@@ -2991,21 +3897,12 @@ export function apply(ctx, rawConfig) {
         if (key === '') return send(400, { error: '没有渠道网关 Key，无法探测' })
         const base = text(config.gatewayUrl) || DEFAULTS.gatewayUrl
         /**
-         * 探测范围：**候选池里去重后的全部模型**。
+         * 探测范围：**候选池里去重后的全部模型**（`probeTargets`）。
          *
          * 用候选池而不是某条链的成员——用户要的是「所有模型的速度，好让我挑
          * 快的」，而不是只测某条链里的。
          */
-        const seen = new Set()
-        const list = []
-        for (const row of allRows) {
-          if (row.contextWindow < positive(config.longContextMin, DEFAULTS.longContextMin)) continue
-          if (row.rate !== undefined && row.rate > positive(config.absurdRate, DEFAULTS.absurdRate)) continue
-          const id = String(row.id ?? '').toLowerCase()
-          if (id === '' || seen.has(id)) continue
-          seen.add(id)
-          list.push({ id: row.id })
-        }
+        const list = probeTargets()
         // 不 await：让它后台跑，端点立刻返回。
         void runProbe({
           list, base, key, force,

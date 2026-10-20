@@ -99,6 +99,36 @@ window.__ModuleLoader__.load({
         maxSlowSkipsHint: '放弃一个就要付出一个超时的代价，太多反而更慢；0 = 不放弃',
         minTokensPerSecond: '最低速度（tokens/秒）',
         minTokensPerSecondHint: '输出低于这个速度就换下一个模型，并把它排到链尾；0 = 不判定',
+        excludeBelowTps: '吞吐淘汰线（tokens/秒）',
+        excludeBelowTpsHint: '实测吞吐低于这个值的模型直接移出全部链（等于取消选择）；没测过的模型不受影响，0 = 不淘汰',
+        fastBandSize: '快速档大小（同时轮换几个）',
+        fastBandSizeHint: '只有吞吐最高的前 N 个模型参与轮流调用。档内轮流当链首，档外只在档内全失败时兜底。1 = 永远只用最快的那个',
+        throughputBandTps: '吞吐分档档宽（tokens/秒）',
+        throughputBandTpsHint: '跨档按吞吐排，同档内按到期→倍率排；0 = 严格按吞吐降序',
+        probeOnStartup: '启动时自动重测全部',
+        probeOnStartupHint: '每次打开软件后自动跑一轮「重测全部」，这样吞吐排序和淘汰线当天就是新鲜的。后台进行，不影响对话',
+        startupProbeSkipMinutes: '启动重测的跳过窗口（分钟）',
+        startupProbeSkipMinutesHint: '上一轮测速在这个时间内完成过，启动时就不重复测；0 = 每次都测',
+        accountExpiryFirst: '账号优先用快到期的',
+        accountExpiryFirstHint: '把积分最快作废的账号排到该渠道的选号第一位，会写回渠道包的账号顺序',
+        accountRotation: '其余账号轮流使用',
+        accountRotationHint: '除快到期账号外，其余账号轮流当第一顺位，避免用量集中在少数账号上',
+        accountReorderMinutes: '账号顺序重排间隔（分钟）',
+        accountReorderMinutesHint: '重排会写渠道包的设置文件，不需要每轮都写；0 = 每轮都重排',
+        droppedTitle: '已淘汰（实测低于吞吐线）',
+        droppedNone: '没有——没有被淘汰的模型',
+        droppedHint: '这些模型实测吞吐低于淘汰线，已从四条链里移除。把淘汰线调低或清空速度画像可以找回',
+        fastBandTitle: '快速档（参与轮换的模型）',
+        fastBandNone: '链里还没有候选',
+        fastBandHint: '每次请求在快速档内轮流选链首：既优先用快的，又不会把用量全压在第一名上。档内全部失败时才降级到档外',
+        accountPlanTitle: '账号顺序（快到期优先 + 轮流）',
+        accountPlanNone: '还没有重排过——需要「查询积分余额」开着，并等一轮余额查询完成',
+        accountPlanChanged: '已重排',
+        accountPlanSame: '顺序未变',
+        accountPlanExpiring: '先到期 {n} 个',
+        droppedTag: '已淘汰',
+        tpsTag: '吞吐',
+        droppedStat: '个已淘汰',
         speedSampleMs: '测速观察窗口（毫秒）',
         speedSampleMsHint: '样本太短会被网络抖动放大，默认 3 秒',
         slowMemoryMinutes: '慢模型记忆（分钟）',
@@ -208,6 +238,36 @@ window.__ModuleLoader__.load({
         maxSlowSkipsHint: 'Each skip costs a full timeout, so too many is slower; 0 = never skip',
         minTokensPerSecond: 'Minimum speed (tokens/s)',
         minTokensPerSecondHint: 'Slower than this and the chain moves on, demoting the model to the tail; 0 disables',
+        excludeBelowTps: 'Throughput cut-off (tokens/s)',
+        excludeBelowTpsHint: 'Models measured below this are removed from every chain (same as unselecting them). Unmeasured models are never dropped; 0 disables',
+        fastBandSize: 'Fast band size (how many rotate)',
+        fastBandSizeHint: 'Only the N fastest models rotate as chain head. The rest stay as fallback. 1 = always the single fastest',
+        throughputBandTps: 'Throughput band width (tokens/s)',
+        throughputBandTpsHint: 'Across bands throughput wins, inside a band expiry then rate wins; 0 = strict throughput order',
+        probeOnStartup: 'Re-measure all on startup',
+        probeOnStartupHint: 'Runs a full measurement after every launch so ordering and the cut-off are fresh. Background only',
+        startupProbeSkipMinutes: 'Startup probe skip window (minutes)',
+        startupProbeSkipMinutesHint: 'Skip the startup sweep if the last one finished within this window; 0 = always run',
+        accountExpiryFirst: 'Use expiring accounts first',
+        accountExpiryFirstHint: 'Puts the account whose credits expire soonest first in the channel-pack account order',
+        accountRotation: 'Rotate the remaining accounts',
+        accountRotationHint: 'The other accounts take turns as first choice so usage does not pile on a few',
+        accountReorderMinutes: 'Account reorder interval (minutes)',
+        accountReorderMinutesHint: 'Reordering writes the channel-pack settings file; 0 = on every tiering',
+        droppedTitle: 'Dropped (below the throughput cut-off)',
+        droppedNone: 'None — nothing has been dropped',
+        droppedHint: 'These measured below the cut-off and are out of all four chains. Lower the cut-off or clear speed profiles to bring them back',
+        fastBandTitle: 'Fast band (the models that rotate)',
+        fastBandNone: 'This chain has no candidates yet',
+        fastBandHint: 'Each request rotates the chain head inside the fast band, so it is both fast and spread out. Falls back outside the band only if the whole band fails',
+        accountPlanTitle: 'Account order (expiring first, then rotate)',
+        accountPlanNone: 'No reorder yet — needs credit-balance lookup on and one completed balance sweep',
+        accountPlanChanged: 'reordered',
+        accountPlanSame: 'unchanged',
+        accountPlanExpiring: '{n} expiring first',
+        droppedTag: 'dropped',
+        tpsTag: 'tps',
+        droppedStat: 'dropped',
         speedSampleMs: 'Speed sample window (ms)',
         speedSampleMsHint: 'Shorter samples get inflated by network jitter; 3 s is the default',
         slowMemoryMinutes: 'Slow-model memory (minutes)',
@@ -371,6 +431,8 @@ window.__ModuleLoader__.load({
 .bps_pickid{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:var(--dsw-alias-label-primary);}
 .bps_picktag{flex:0 0 auto;font-size:11px;}
+/* 已淘汰标记：与 👁 并排，用弱化的红色，不抢 id 的视线。 */
+.bps_droppedtag{color:var(--dsw-alias-state-error-primary,#e5484d);opacity:.85;}
 .bps_pickrate{flex:0 0 auto;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-tertiary);}
 .bps_pickbtn{flex:0 0 auto;font-size:11px;color:var(--dsw-alias-state-business-primary);}
 /* 主面板外壳：左导航入口点进来时用这一套，而不是设置对话框的窄栏。 */
@@ -486,19 +548,22 @@ window.__ModuleLoader__.load({
     /**
      * 实测速度的显示格式。
      *
-     * 首字延迟是用户体感的大头，所以主要显示它（`1.2s` 比 `1200ms` 好读）；
-     * 吞吐作为补充（`80t/s`），只在有数据时显示。两者都没有就是「—」，表示
-     * 「还没测过」，而不是「很慢」——这个区别很重要，否则用户会以为模型坏了。
+     * 用户的新规则是「按吞吐量从大到小排序」，所以**吞吐放在前面**——列表顺序
+     * 由它决定，显示时它就该是最显眼的那个。首字延迟作为补充（`1.2s`），因为
+     * 它仍然是「点下发送到看见第一个字」的体感来源。
+     *
+     * 两者都没有就是「—」，表示「还没测过」，而不是「很慢」——这个区别很重要，
+     * 否则用户会以为模型坏了。
      */
     const formatSpeed = speed => {
       if (speed === null || speed === undefined) return '—'
       const ttfb = Number(speed.ttfb)
       const tps = Number(speed.tps)
       const parts = []
+      if (Number.isFinite(tps) && tps > 0) parts.push(`${Math.round(tps)}t/s`)
       if (Number.isFinite(ttfb) && ttfb > 0) {
         parts.push(ttfb >= 1000 ? `${(ttfb / 1000).toFixed(1)}s` : `${Math.round(ttfb)}ms`)
       }
-      if (Number.isFinite(tps) && tps > 0) parts.push(`${Math.round(tps)}t/s`)
       return parts.length > 0 ? parts.join(' · ') : '—'
     }
 
@@ -641,6 +706,14 @@ window.__ModuleLoader__.load({
                   className: on ? 'bps_linkid bps_linkon' : 'bps_linkid',
                 }, row.id),
                 row.vision === true ? h('span', { className: 'bps_picktag' }, '👁') : null,
+                /**
+                 * 已淘汰标记。
+                 *
+                 * 淘汰的模型**仍然留在列表里**（只是不进链），用户才能看到「它
+                 * 为什么不在」并决定要不要调低门槛。勾上它不会有副作用——分层
+                 * 时会再按同一判据过滤一遍。
+                 */
+                row.dropped === true ? h('span', { className: 'bps_picktag bps_droppedtag' }, t('droppedTag')) : null,
                 // 实测速度：首字延迟 + 吞吐。没测过显示「—」，测过就一眼看出快慢。
                 h('span', {
                   className: Number.isFinite(row.speed?.ttfb) && row.speed.ttfb > 10000
@@ -960,26 +1033,23 @@ window.__ModuleLoader__.load({
         }
         return [...byId.values()].sort((a, b) => {
           /**
-           * 排序：**测过速度的优先，首字快的在前**。
+           * 排序：**吞吐降序**（用户新规则）。
            *
-           * 用户想「按速度挑模型」，所以把实测数据直接用在排序上——一眼就能
-           * 看到哪些快。没测过的排在后面（按 id 稳定排序），等探测补齐。
+           * 用户的新规则是「4 个分类里面的模型按照吞吐量从大到小排序」，所以
+           * 设置页的候选列表也按吞吐排——列表顺序与链里的调用顺序一致，用户
+           * 在页面上看到的第一个就是实际会先被调用的那个。
+           *
+           * 没有吞吐数据的排在后面（按 id 稳定排序）：它们既没被证明快，也没被
+           * 证明慢，不该抢在实测快的模型前面。
+           *
+           * 位置仍然**与勾选状态无关**：曾经按「已勾选优先」排，结果用户点第
+           * 3 行时那一行立刻跳到第 1 行，看起来像「点哪儿都是选中第一个」。
            */
-          /**
-           * 排序：**位置必须稳定**，与勾选状态无关。
-           *
-           * 这里曾经按「已勾选优先」排序，结果用户点第 3 行时，那一行立刻
-           * 跳到第 1 行——视觉上就是「我点哪儿都是选中第一个」。可变列表里
-           * 让被点的对象从手指底下移走，是纯粹的干扰。
-           *
-           * 所以只按实测速度（快的在前）排，同速按 id 稳定排序。想找已选项
-           * 用搜索框；已选项用加粗名字标记，不靠位置。
-           */
-          const sa = a.speed?.ttfb
-          const sb = b.speed?.ttfb
-          const ha = Number.isFinite(sa)
-          const hb = Number.isFinite(sb)
-          if (ha && hb && sa !== sb) return sa - sb
+          const ta = Number(a.speed?.tps)
+          const tb = Number(b.speed?.tps)
+          const ha = Number.isFinite(ta) && ta > 0
+          const hb = Number.isFinite(tb) && tb > 0
+          if (ha && hb && ta !== tb) return tb - ta
           if (ha !== hb) return ha ? -1 : 1
           return String(a.id).localeCompare(String(b.id))
         })
@@ -1066,6 +1136,16 @@ window.__ModuleLoader__.load({
               ? h('span', { className: 'bps_stat bps_statwarn' },
                 h('span', { className: 'bps_statnum' }, formatCredits(status.credits.expiring)),
                 h('span', { className: 'bps_statlabel' }, t('creditsExpiring')))
+              : null,
+            /**
+             * 已淘汰数：让「模型数比候选池少」有解释。
+             *
+             * 只有真的有淘汰时才显示——0 的时候多一个「0 个已淘汰」只是噪声。
+             */
+            Number.isFinite(status.dropped) && status.dropped > 0
+              ? h('span', { className: 'bps_stat bps_statwarn' },
+                h('span', { className: 'bps_statnum' }, String(status.dropped)),
+                h('span', { className: 'bps_statlabel' }, t('droppedStat')))
               : null),
           // 额度型渠道的数字不能与积分相加，单独一句话说明，避免「8 千万分」的误解。
           status.credits !== undefined
@@ -1204,6 +1284,28 @@ window.__ModuleLoader__.load({
                 value: config.minTokensPerSecond, min: 0,
                 onCommit: value => save({ minTokensPerSecond: value }),
               }),
+              /**
+               * 吞吐淘汰线：用户明确要求「低于 50 tok/s 的直接取消选择」。
+               *
+               * 与上面的「最低速度」分开两项，因为它们的作用时刻不同：这一项
+               * 决定**谁进链**（分层期），上面那项决定**这一轮要不要换人**
+               * （请求期）。合成一项会让「只想排序、不想删模型」没法表达。
+               */
+              h(NumberField, {
+                label: t('excludeBelowTps'), hint: t('excludeBelowTpsHint'),
+                value: config.excludeBelowTps, min: 0,
+                onCommit: value => save({ excludeBelowTps: value }),
+              }),
+              h(NumberField, {
+                label: t('fastBandSize'), hint: t('fastBandSizeHint'),
+                value: config.fastBandSize, min: 1,
+                onCommit: value => save({ fastBandSize: value }),
+              }),
+              h(NumberField, {
+                label: t('throughputBandTps'), hint: t('throughputBandTpsHint'),
+                value: config.throughputBandTps, min: 0,
+                onCommit: value => save({ throughputBandTps: value }),
+              }),
               h(NumberField, {
                 label: t('speedSampleMs'), hint: t('speedSampleMsHint'),
                 value: config.speedSampleMs, min: 500, step: 500,
@@ -1272,6 +1374,55 @@ window.__ModuleLoader__.load({
                   }),
                   h('span', null, config.autoProbeOnRefresh === true ? t('yes') : t('no'))),
                 h('p', { className: 'bps_hint' }, t('autoProbeHint'))),
+              /**
+               * 启动自动重测：用户明确要求「每次开起软件就自动运行一次重测全部」。
+               *
+               * 与上面那项的区别是触发时机：那项是「点立即重新分层时」，
+               * 这顶是「进程启动后」。两个都开不会冲突——探测是单飞的。
+               */
+              h('div', { className: 'bps_field' },
+                h('label', null, t('probeOnStartup')),
+                h('label', { className: 'bps_check' },
+                  h('input', {
+                    type: 'checkbox', checked: config.probeOnStartup === true,
+                    onChange: event => save({ probeOnStartup: event.target.checked }),
+                  }),
+                  h('span', null, config.probeOnStartup === true ? t('yes') : t('no'))),
+                h('p', { className: 'bps_hint' }, t('probeOnStartupHint'))),
+              h(NumberField, {
+                label: t('startupProbeSkipMinutes'), hint: t('startupProbeSkipMinutesHint'),
+                value: config.startupProbeSkipMinutes, min: 0,
+                onCommit: value => save({ startupProbeSkipMinutes: value }),
+              }),
+              /**
+               * 账号层：快到期优先 + 轮流。
+               *
+               * 这两项是「不要集中用几个模型/账号」诉求在**账号**维度的落点，
+               * 与上面的快速档（模型维度）互补。
+               */
+              h('div', { className: 'bps_field' },
+                h('label', null, t('accountExpiryFirst')),
+                h('label', { className: 'bps_check' },
+                  h('input', {
+                    type: 'checkbox', checked: config.accountExpiryFirst === true,
+                    onChange: event => save({ accountExpiryFirst: event.target.checked }),
+                  }),
+                  h('span', null, config.accountExpiryFirst === true ? t('yes') : t('no'))),
+                h('p', { className: 'bps_hint' }, t('accountExpiryFirstHint'))),
+              h('div', { className: 'bps_field' },
+                h('label', null, t('accountRotation')),
+                h('label', { className: 'bps_check' },
+                  h('input', {
+                    type: 'checkbox', checked: config.accountRotation === true,
+                    onChange: event => save({ accountRotation: event.target.checked }),
+                  }),
+                  h('span', null, config.accountRotation === true ? t('yes') : t('no'))),
+                h('p', { className: 'bps_hint' }, t('accountRotationHint'))),
+              h(NumberField, {
+                label: t('accountReorderMinutes'), hint: t('accountReorderMinutesHint'),
+                value: config.accountReorderMinutes, min: 0,
+                onCommit: value => save({ accountReorderMinutes: value }),
+              }),
               h('div', { className: 'bps_field' },
                 h('label', null, t('verbose')),
                 h('label', { className: 'bps_check' },
@@ -1306,6 +1457,75 @@ window.__ModuleLoader__.load({
                       } finally { setBusy(false) }
                     },
                   }, t('clearSlow'))))
+            })()),
+
+          /**
+           * 已淘汰清单：让「低于吞吐线的模型不进链」这件事**可见**。
+           *
+           * 没有这一块，用户会看到候选池里列着一个模型、勾上了、却怎么也不
+           * 在链里——那看起来就是 bug。列出它、并给出「调低门槛或清空画像」
+           * 的出路，才是可解释的。
+           */
+          h('div', { className: 'bps_section' },
+            h('div', { className: 'bps_sectiontitle' }, t('droppedTitle')),
+            (() => {
+              const dropped = Array.isArray(config?.dropped) ? config.dropped : []
+              if (dropped.length === 0) return h('p', { className: 'bps_note' }, t('droppedNone'))
+              return h(Fragment, null,
+                h('ul', { className: 'bps_list' },
+                  dropped.slice(0, 30).map(row => h('li', { key: row.id },
+                    h('span', null, row.id),
+                    h('span', { className: 'bps_speed bps_speedslow' },
+                      Number.isFinite(row.tps) ? `${Math.round(row.tps)}t/s` : '—')))),
+                h('p', { className: 'bps_hint' }, t('droppedHint')))
+            })()),
+
+          /**
+           * 快速档：显示「这次会轮到哪几个」。
+           *
+           * 用户的核心诉求是「既要快、又要分散」。这两件事只体现在快速档里：
+           * 档内轮流 = 分散，档内都是最快的那几个 = 快。所以它必须能看见。
+           */
+          h('div', { className: 'bps_section' },
+            h('div', { className: 'bps_sectiontitle' }, t('fastBandTitle')),
+            h('p', { className: 'bps_hint' }, t('fastBandHint')),
+            (() => {
+              const bands = config?.fastBand
+              if (bands === null || typeof bands !== 'object') return h('p', { className: 'bps_note' }, t('fastBandNone'))
+              return h('ul', { className: 'bps_list' },
+                CHAIN_ORDER.map(key => {
+                  const band = bands[key]
+                  const links = Array.isArray(band?.links) ? band.links : []
+                  if (links.length === 0) return null
+                  return h('li', { key },
+                    h('span', { className: 'bps_cardname' }, chainNames[key]),
+                    h('span', { className: 'bps_rate' },
+                      links.map(row => `${row.id.split('/').pop()}${Number.isFinite(row.tps) ? ' ' + Math.round(row.tps) + 't/s' : ''}`).join(' · ')))
+                }).filter(Boolean))
+            })()),
+
+          /**
+           * 账号顺序：让用户看到「哪些账号因为快到期被提前、其余怎么轮」。
+           *
+           * 这是账号维度唯一可观察的地方——不展示的话，用户只能看到渠道包
+           * 里顺序莫名其妙地变了。
+           */
+          h('div', { className: 'bps_section' },
+            h('div', { className: 'bps_sectiontitle' }, t('accountPlanTitle')),
+            (() => {
+              const plan = config?.accountPlan
+              const providers = plan !== null && typeof plan === 'object' && plan.providers !== null && typeof plan.providers === 'object'
+                ? Object.entries(plan.providers)
+                : []
+              if (providers.length === 0) return h('p', { className: 'bps_note' }, t('accountPlanNone'))
+              return h('ul', { className: 'bps_list' },
+                providers.map(([provider, info]) => h('li', { key: provider },
+                  h('span', null, provider),
+                  h('span', { className: 'bps_rate' },
+                    [
+                      info?.changed === true ? t('accountPlanChanged') : t('accountPlanSame'),
+                      t('accountPlanExpiring').replace('{n}', String(Array.isArray(info?.expiring) ? info.expiring.length : 0)),
+                    ].join(' · ')))))
             })()),
 
           /**

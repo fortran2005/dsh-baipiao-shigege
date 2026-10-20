@@ -93,11 +93,21 @@ check('POST /refresh 重新分层', refreshed.status === 200
   && refreshed.body.chains?.free?.links?.length > 0,
   `free=${refreshed.body.chains?.free?.links?.length}`)
 
-// Config schema still renders 9 fields.
+// Config schema 覆盖全部声明的配置项。
+/**
+ * 与 `DEFAULTS` 的键集对齐，而不是写死数字。
+ *
+ * 早期这里固定成 26，结果每次新增配置项都会「测试失败」，而失败的原因不是
+ * 功能坏了，只是断言过期——这种噪声会让人忽略真正的回归。
+ */
 const json = Config.toJSON()
 const root = Object.entries(json.refs).find(([, r]) => r.dict)
-check('设置 schema 是 26 项', Object.keys(root?.[1]?.dict ?? {}).length === 26,
-  Object.keys(root?.[1]?.dict ?? {}).join(', '))
+const fields = Object.keys(root?.[1]?.dict ?? {})
+const declared = Object.keys(DEFAULTS)
+const missing = declared.filter(key => !fields.includes(key))
+const extra = fields.filter(key => !declared.includes(key))
+check(`设置 schema 覆盖全部 ${declared.length} 个配置项`, missing.length === 0 && extra.length === 0,
+  missing.length > 0 ? `缺少：${missing.join(', ')}` : (extra.length > 0 ? `多出：${extra.join(', ')}` : `${fields.length} 项`))
 
 console.log(failures === 0 ? '\n全部通过' : `\n${failures} 项失败`)
 process.exit(failures === 0 ? 0 : 1)

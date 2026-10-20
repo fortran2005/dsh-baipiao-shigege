@@ -22,3 +22,6 @@ Thumbs.db
 settings.json
 speed-memory.json
 last-request.json
+
+# 运行期数据（设置与速度画像），跟着副本走但不入库
+.runtime-data/
