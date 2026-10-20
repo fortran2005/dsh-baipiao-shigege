@@ -4117,17 +4117,30 @@ export function apply(ctx, rawConfig) {
     rate: row.rate ?? null,
     vision: row.vision === true,
     speed: speedOf(row.id, { speedMemoryMinutes: config.speedMemoryMinutes }),
-    dropped: filterDropped([row], {
-      excludeBelowTps: config.excludeBelowTps,
-      speedMemoryMinutes: config.speedMemoryMinutes,
-      slowMemoryMinutes: config.slowMemoryMinutes,
-      errorRateMax: config.errorRateMax,
-      errorStatsMinSamples: config.errorStatsMinSamples,
-      errorStatsDays: config.errorStatsDays,
-      errorStatsMinutes: config.errorStatsMinutes,
-    }).length === 0,
-    /** 真实请求错误率（来自渠道包账本）；没数据时 undefined。 */
-    errorRate: errorStatsOf(row.id, { errorStatsMinutes: config.errorStatsMinutes })?.rate,
+    /**
+     * 是否被淘汰，**以及为什么**。
+     *
+     * 只回一个布尔值不够：用户看到「246 t/s 已淘汰」会以为逻辑错了，实际是
+     * 错误率 71%。所以把原因拆成 `droppedReason`：`error` / `speed` / `both`。
+     */
+    ...(function () {
+      const speed = speedOf(row.id, { speedMemoryMinutes: config.speedMemoryMinutes })
+      const err = errorStatsOf(row.id, { errorStatsMinutes: config.errorStatsMinutes })
+      const tps = Number(speed?.tps)
+      const hasTps = Number.isFinite(tps) && tps > 0
+      const cut = Number(config.excludeBelowTps)
+      const errMax = Number(config.errorRateMax)
+      const minSamples = Math.max(1, Math.trunc(Number(config.errorStatsMinSamples) || 0))
+      const byError = err !== undefined && Number(err.requests) >= minSamples && Number(err.rate) > errMax
+      const bySpeed = Number.isFinite(cut) && cut > 0 && hasTps && tps < cut
+      return {
+        dropped: byError || bySpeed,
+        droppedReason: byError && bySpeed ? 'both' : (byError ? 'error' : (bySpeed ? 'speed' : null)),
+        /** 真实请求错误率（来自渠道包账本）；没数据时 undefined。 */
+        errorRate: err?.rate,
+        errorSamples: err?.requests,
+      }
+    })(),
   })
 
   /**
@@ -4278,30 +4291,47 @@ export function apply(ctx, rawConfig) {
    */
   function droppedSnapshot() {
     const cut = Number(config.excludeBelowTps)
-    if (!Number.isFinite(cut) || cut <= 0) return []
+    const speedOn = Number.isFinite(cut) && cut > 0
+    const errorOn = Number.isFinite(Number(config.errorRateMax)) && Number(config.errorRateMax) > 0
+    if (!speedOn && !errorOn) return []
     const out = []
     for (const row of poolRows()) {
-      if (!filterDropped([row], {
-        excludeBelowTps: cut,
-        speedMemoryMinutes: config.speedMemoryMinutes,
-        slowMemoryMinutes: config.slowMemoryMinutes,
-        errorRateMax: config.errorRateMax,
-        errorStatsMinSamples: config.errorStatsMinSamples,
-        errorStatsDays: config.errorStatsDays,
-        errorStatsMinutes: config.errorStatsMinutes,
-      }).length) {
-        const speed = speedOf(row.id, { speedMemoryMinutes: config.speedMemoryMinutes })
-        const err = errorStatsOf(row.id, { errorStatsMinutes: config.errorStatsMinutes })
-        out.push({
-          id: row.id,
-          tps: Number.isFinite(Number(speed?.tps)) ? Number(speed.tps) : null,
-          /** 真实请求错误率；有值说明这条可能是因为它被淘汰的。 */
-          errorRate: err?.rate ?? null,
-        })
-      }
+      const speed = speedOf(row.id, { speedMemoryMinutes: config.speedMemoryMinutes })
+      const err = errorStatsOf(row.id, { errorStatsMinutes: config.errorStatsMinutes })
+      const tps = Number(speed?.tps)
+      const hasTps = Number.isFinite(tps) && tps > 0
+      /**
+       * ## 淘汰原因必须**分别算出来**，不能只回一个「已淘汰」
+       *
+       * 用户看到「246 t/s 已淘汰」时一定会困惑——单看吞吐它是达标的。真实
+       * 原因是它被**错误率**淘汰（71% 的请求失败）。页面必须把这两件事分开
+       * 说清楚，否则这个功能就是不可解释的。
+       */
+      const byError = err !== undefined
+        && Number(err.requests) >= Math.max(1, Math.trunc(Number(config.errorStatsMinSamples) || 0))
+        && Number(err.rate) > Number(config.errorRateMax)
+      const bySpeed = speedOn && hasTps && tps < cut
+      if (!byError && !bySpeed) continue
+      out.push({
+        id: row.id,
+        tps: hasTps ? tps : null,
+        /** 真实请求错误率；没数据时为 null。 */
+        errorRate: err?.rate ?? null,
+        /** 错误率的样本数，让用户能判断「这个结论可不可信」。 */
+        errorSamples: err?.requests ?? null,
+        /** 淘汰原因：`error` / `speed` / `both`。 */
+        reason: byError && bySpeed ? 'both' : (byError ? 'error' : 'speed'),
+      })
     }
-    // 最慢的排前面：用户想看的正是「哪些被砍了、有多慢」。
-    return out.sort((a, b) => (a.tps ?? 999) - (b.tps ?? 999))
+    /**
+     * 排序：**错误率淘汰的排前面**。
+     *
+     * 因为它们的吞吐往往很好看（200+ tps），用户最容易在这里产生疑问
+     * 「这么快为什么被砍」——把它们放前面，配上原因和错误率，一眼就能解释。
+     * 其次按吞吐升序（越慢越该被砍）。
+     */
+    const rank = r => (r.reason === 'error' ? 0 : r.reason === 'both' ? 1 : 2)
+    return out.sort((a, b) => rank(a) - rank(b) || (a.tps ?? 999) - (b.tps ?? 999))
   }
 
   /**

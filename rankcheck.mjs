@@ -25,7 +25,7 @@ const {
     markSlow, markFast, recordSpeed, filterDropped, rankCandidates, throughputOf,
     planAccountOrder, resetAccountRotation, isSpeedFailure,
     speedOf, encodeMembers, toChatBody, estimateTps, countTokens, tierOf, isDropped,
-    errorVerdict, resetErrorStats,
+    errorVerdict, resetErrorStats, errorStatsOf,
 } = m
 
 let failures = 0
@@ -550,6 +550,78 @@ check('错误率不超标时，速度门槛为 0 就不淘汰',
   isDropped('mock/err-low', 0, errOpt) === false)
 
 resetErrorStats()
+
+// ── 12. 淘汰原因必须可解释 ────────────────────────────────────────────
+//
+// 用户看到「246 t/s 已淘汰」会以为逻辑错了——实际是错误率 71% 把它挡掉的。
+// 所以 state 里必须分别给出「是否淘汰」和「为什么淘汰」，页面才能说清楚。
+
+clearSlowModels()
+resetErrorStats()
+
+/**
+ * 造一份账本 + 速度画像，构造三种淘汰原因。
+ *
+ * 注意这里**必须**用真实的 errorStats 读取路径（写文件 → resetErrorStats →
+ * errorStatsOf），否则测的只是纯函数，验不到「读账本」这一环。
+ */
+const ledgerDir2 = path.join(process.env.DSH_HOME, 'channel-pack')
+fs.mkdirSync(ledgerDir2, { recursive: true })
+fs.writeFileSync(path.join(ledgerDir2, 'token-ledger.json'), JSON.stringify({
+  days: {
+    [new Date().toISOString().slice(0, 10)]: {
+      'direct|mock|mock-a|reason-error': { requests: 100, errors: 90, ttftCount: 100, ttftSumMs: 200000 },
+      'direct|mock|mock-a|reason-speed': { requests: 100, errors: 2, ttftCount: 100, ttftSumMs: 200000 },
+      'direct|mock|mock-a|reason-both': { requests: 100, errors: 90, ttftCount: 100, ttftSumMs: 200000 },
+      'direct|mock|mock-a|reason-ok': { requests: 100, errors: 2, ttftCount: 100, ttftSumMs: 200000 },
+    },
+  },
+}), 'utf8')
+resetErrorStats()
+
+// 速度快慢：error 那个故意给高吞吐（模拟「246 t/s 却被淘汰」的场景）
+recordSpeed('mock/reason-error', { ttfb: 900, tps: 246 })
+recordSpeed('mock/reason-speed', { ttfb: 900, tps: 30 })
+recordSpeed('mock/reason-both', { ttfb: 900, tps: 20 })
+recordSpeed('mock/reason-ok', { ttfb: 900, tps: 150 })
+
+const reasonOpt = {
+  speedMemoryMinutes: 180, slowMemoryMinutes: 30, excludeBelowTps: 70,
+  errorRateMax: 0.5, errorStatsMinSamples: 20, errorStatsDays: 7, errorStatsMinutes: 30,
+}
+/** 复刻 shape() 里的判定（同一套输入，验证结论一致）。 */
+const classify = id => {
+  const sp = speedOf(id, { speedMemoryMinutes: reasonOpt.speedMemoryMinutes })
+  const err = errorStatsOf(id, { errorStatsMinutes: reasonOpt.errorStatsMinutes })
+  const tps = Number(sp?.tps)
+  const hasTps = Number.isFinite(tps) && tps > 0
+  const byError = err !== undefined && Number(err.requests) >= reasonOpt.errorStatsMinSamples
+    && Number(err.rate) > reasonOpt.errorRateMax
+  const bySpeed = hasTps && tps < reasonOpt.excludeBelowTps
+  return {
+    dropped: byError || bySpeed,
+    reason: byError && bySpeed ? 'both' : (byError ? 'error' : (bySpeed ? 'speed' : null)),
+  }
+}
+
+check('高吞吐 + 高错误率 → 原因是 error（不是 speed）',
+  classify('mock/reason-error').reason === 'error', JSON.stringify(classify('mock/reason-error')))
+check('低吞吐 + 低错误率 → 原因是 speed',
+  classify('mock/reason-speed').reason === 'speed', JSON.stringify(classify('mock/reason-speed')))
+check('两者都超标 → 原因是 both',
+  classify('mock/reason-both').reason === 'both', JSON.stringify(classify('mock/reason-both')))
+check('都达标 → 不淘汰、无原因',
+  classify('mock/reason-ok').dropped === false && classify('mock/reason-ok').reason === null,
+  JSON.stringify(classify('mock/reason-ok')))
+
+// 关键回归：一个 246 t/s 的模型被淘汰时，原因必须是 error 而不是含糊的「已淘汰」
+const highSpeedDropped = classify('mock/reason-error')
+check('「246 t/s 却被淘汰」能解释清楚（原因=error，而非速度）',
+  highSpeedDropped.dropped === true && highSpeedDropped.reason === 'error',
+  `dropped=${highSpeedDropped.dropped} reason=${highSpeedDropped.reason}`)
+
+resetErrorStats()
+clearSlowModels()
 
 clearSlowModels()
 console.log(failures === 0 ? '\n全部通过' : '\n' + failures + ' 项失败')

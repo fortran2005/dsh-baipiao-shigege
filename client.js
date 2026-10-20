@@ -138,6 +138,15 @@ window.__ModuleLoader__.load({
         accountPlanSame: '顺序未变',
         accountPlanExpiring: '先到期 {n} 个',
         droppedTag: '已淘汰',
+        /**
+         * 淘汰原因文案。
+         *
+         * 只写「已淘汰」会让用户困惑：一个 246 t/s 的模型明明很快，凭什么被砍？
+         * 真实原因是错误率 71%。所以标签必须说清是**哪条线**把它挡掉的。
+         */
+        droppedByError: '错误率 {pct}%',
+        droppedBySpeed: '速度 {tps}t/s',
+        droppedByBoth: '错误率 {pct}% · 速度 {tps}t/s',
         tpsTag: '吞吐',
         droppedStat: '个已淘汰',
         speedSampleMs: '测速观察窗口（毫秒）',
@@ -288,6 +297,9 @@ window.__ModuleLoader__.load({
         accountPlanSame: 'unchanged',
         accountPlanExpiring: '{n} expiring first',
         droppedTag: 'dropped',
+        droppedByError: 'error {pct}%',
+        droppedBySpeed: 'speed {tps}t/s',
+        droppedByBoth: 'error {pct}% · speed {tps}t/s',
         tpsTag: 'tps',
         droppedStat: 'dropped',
         speedSampleMs: 'Speed sample window (ms)',
@@ -568,6 +580,54 @@ window.__ModuleLoader__.load({
     const formatRate = value => (typeof value === 'number' && Number.isFinite(value) ? `x${value}` : '—')
 
     /**
+     * 淘汰标签的短文案：**说清是哪条线把它挡掉的**。
+     *
+     * 只显示「已淘汰」会让用户困惑——一个 246 t/s 的模型明明很快，凭什么砍？
+     * 因为它错误率 71%。这两件事必须同时呈现，否则这个功能不可解释。
+     *
+     * @param {object} row - 候选行（带 dropped / droppedReason / errorRate / tps）
+     * @param {function} t - 文案函数
+     */
+    const droppedLabel = (row, t) => {
+      const pct = Number.isFinite(row?.errorRate) ? Math.round(row.errorRate * 100) : null
+      const tps = Number.isFinite(row?.tps) ? Math.round(row.tps) : null
+      const reason = row?.droppedReason
+      if (reason === 'error' && pct !== null) {
+        return t('droppedByError').replace('{pct}', String(pct))
+      }
+      if (reason === 'speed' && tps !== null) {
+        return t('droppedBySpeed').replace('{tps}', String(tps))
+      }
+      if (reason === 'both') {
+        return t('droppedByBoth')
+          .replace('{pct}', String(pct ?? '?'))
+          .replace('{tps}', String(tps ?? '?'))
+      }
+      return t('droppedTag')
+    }
+
+    /**
+     * 悬停详情：把判断依据与样本量都写出来。
+     *
+     * 样本量很重要——「错误率 71%」听起来很确定，但如果只有 3 次请求，
+     * 那这个结论就不可信（插件本身也要求 >= 20 次才判）。
+     */
+    const droppedDetail = (row, t) => {
+      const parts = []
+      if (row?.droppedReason === 'error' || row?.droppedReason === 'both') {
+        const pct = Number.isFinite(row?.errorRate) ? Math.round(row.errorRate * 100) : '?'
+        const n = Number.isFinite(row?.errorSamples) ? row.errorSamples : '?'
+        parts.push(`真实请求错误率 ${pct}%（样本 ${n} 次）`)
+      }
+      if (row?.droppedReason === 'speed' || row?.droppedReason === 'both') {
+        const tps = Number.isFinite(row?.tps) ? Math.round(row.tps) : '?'
+        parts.push(`实测吞吐 ${tps} tok/s`)
+      }
+      if (parts.length === 0) return t('droppedTag')
+      return parts.join('；')
+    }
+
+    /**
      * 实测速度的显示格式。
      *
      * 用户的新规则是「按吞吐量从大到小排序」，所以**吞吐放在前面**——列表顺序
@@ -743,7 +803,19 @@ window.__ModuleLoader__.load({
                  * 为什么不在」并决定要不要调低门槛。勾上它不会有副作用——分层
                  * 时会再按同一判据过滤一遍。
                  */
-                row.dropped === true ? h('span', { className: 'bps_picktag bps_droppedtag' }, t('droppedTag')) : null,
+                /**
+                 * 淘汰标签：**必须说明原因**。
+                 *
+                 * 用户看到「246 t/s 已淘汰」时第一反应是「这么快为什么砍」——
+                 * 因为页面上没说它其实是错误率 71% 被砍的。标签直接给出原因和
+                 * 数值，这个问题就不存在了。
+                 */
+                row.dropped === true
+                  ? h('span', {
+                    className: 'bps_picktag bps_droppedtag',
+                    title: droppedDetail(row, t),
+                  }, droppedLabel(row, t))
+                  : null,
                 // 实测速度：首字延迟 + 吞吐。没测过显示「—」，测过就一眼看出快慢。
                 h('span', {
                   className: Number.isFinite(row.speed?.ttfb) && row.speed.ttfb > 10000
