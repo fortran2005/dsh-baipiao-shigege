@@ -1005,10 +1005,26 @@ export function buildTiers(rows, config) {
    */
   const demote = list => demoteSlow(list, { slowMemoryMinutes: config.slowMemoryMinutes })
 
+  /**
+   * 是否对某条链应用 `cap()`。
+   *
+   * `cap()` 是「帮你挑一批合理的候选」的启发式：单渠道最多 N 个、总数最多
+   * M 个。它只应作用于**自动分层**——用户没动过这条链时，我们替他决定。
+   *
+   * 用户一旦显式勾选，就不能再截断：勾了什么就该跑什么。否则会出现
+   * 「界面上勾了、链里没有」——因为界面列表（`eligible`）不经过 cap，
+   * 而实际成员要经过，两者不一致时，用户点全选看起来就毫无反应。
+   */
+  const capFor = manual => (manual === null ? cap : list => list)
+
+  const freeCap = capFor(freeManual)
+  const lowCap = capFor(lowManual)
+  const highCap = capFor(highManual)
+
   return {
-    free: demote(cap(freeOrdered)),
-    low: demote(cap(low.sort(bySpeed))),
-    high: demote(cap(high.sort(bySpeed))),
+    free: demote(freeCap(freeOrdered)),
+    low: demote(lowCap(low.slice().sort(bySpeed))),
+    high: demote(highCap(high.slice().sort(bySpeed))),
     /**
      * Custom 不 `cap`（用户在设置页勾了多少就该跑多少），但**要排序**：
      * auto 模式下它是一整个池，按「整轮最快」排才能让吞吐大的模型先跑；
