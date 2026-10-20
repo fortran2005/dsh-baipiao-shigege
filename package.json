@@ -9,6 +9,14 @@
     "./client": "./client.js",
     "./package.json": "./package.json"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fortran2005/dsh-baipiao-shigege.git"
+  },
+  "homepage": "https://github.com/fortran2005/dsh-baipiao-shigege#readme",
+  "bugs": {
+    "url": "https://github.com/fortran2005/dsh-baipiao-shigege/issues"
+  },
   "files": [
     "index.js",
     "client.js",
