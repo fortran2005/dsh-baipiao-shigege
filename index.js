@@ -2292,8 +2292,12 @@ export async function runProbe(deps) {
          * 不清的话，一个昨天被请求期判慢的模型即使今天测出 120 tok/s，仍会
          * 因为 `isSlow` 为真而被 `filterDropped` 挡在链外——「重测全部」就
          * 失去了「重新证明自己」的意义。
+         *
+         * 门槛从 `deps` 里取：`runProbe` 是模块级函数，**看不到** `apply` 里的
+         * `config` 闭包。任何 `config.xxx` 出现在这里都是 ReferenceError。
          */
-        if (Number(result.tps) > 0 && Number(result.tps) >= positive(config.minTokensPerSecond, DEFAULTS.minTokensPerSecond)) {
+        const floor = positive(deps.minTokensPerSecond, DEFAULTS.minTokensPerSecond)
+        if (Number(result.tps) > 0 && Number(result.tps) >= floor) {
           markFast(row.id)
         }
       } else {
@@ -3405,6 +3409,7 @@ export function apply(ctx, rawConfig) {
        */
       force: true,
       speedMemoryMinutes: config.speedMemoryMinutes,
+      minTokensPerSecond: config.minTokensPerSecond,
       onProgress: (done, total) => { if (done % 25 === 0 || done === total) log(`启动重测 ${done}/${total}`) },
     }).then(result => {
       if (result.started === true) {
@@ -3866,6 +3871,7 @@ export function apply(ctx, rawConfig) {
             void runProbe({
               list, base, key, force: false,
               speedMemoryMinutes: config.speedMemoryMinutes,
+              minTokensPerSecond: config.minTokensPerSecond,
               onProgress: (done, total) => { if (done % 25 === 0 || done === total) log(`自动测速 ${done}/${total}`) },
             }).then(result => {
               if (result.started === true) log(`重新分层后自动测速 ${result.total} 个模型`)
@@ -3907,6 +3913,7 @@ export function apply(ctx, rawConfig) {
         void runProbe({
           list, base, key, force,
           speedMemoryMinutes: config.speedMemoryMinutes,
+          minTokensPerSecond: config.minTokensPerSecond,
           onProgress: (done, total) => {
             if (done % 25 === 0 || done === total) log(`速度探测 ${done}/${total}`)
           },
