@@ -441,6 +441,43 @@ check('84 tok/s 不达标', isDropped('cut/just-below', 85, { speedMemoryMinutes
 check('全部样本失败的模型算不达标（不是「没测过」）', isDropped('cut/all-fail-1', 85, { speedMemoryMinutes: 180, slowMemoryMinutes: 30 }) === true)
 check('没测过的模型不算不达标', isDropped('cut/never-measured', 85, { speedMemoryMinutes: 180, slowMemoryMinutes: 30 }) === false)
 
+// ── 10. 首字等待上限 15 秒，且与「启动慢」阈值保持一致 ─────────────────
+//
+// 用户要求：首字母出字限制在 15s。
+//
+// 两个阈值必须一起改，否则会出现自相矛盾的行为：
+//   - firstTokenTimeoutMs = 15s 但 slowTtfbMs = 10s：
+//     一个 12 秒出字的模型「等满了、拿到了答案」，却被判定为「启动慢」，
+//     下一轮被排到链尾——用户明明已经接受等 15 秒。
+//   - 反过来（放弃 < 降级）更糟：还没到降级线就先被放弃，
+//     降级判定永远不生效。
+
+check('首字等待上限默认 15000ms', DEFAULTS.firstTokenTimeoutMs === 15000, String(DEFAULTS.firstTokenTimeoutMs))
+check('「启动慢」阈值默认 15000ms', DEFAULTS.slowTtfbMs === 15000, String(DEFAULTS.slowTtfbMs))
+check('放弃阈值 >= 降级阈值（否则降级永不生效）',
+  DEFAULTS.firstTokenTimeoutMs >= DEFAULTS.slowTtfbMs,
+  `${DEFAULTS.firstTokenTimeoutMs} >= ${DEFAULTS.slowTtfbMs}`)
+
+// 首字 12 秒、吞吐达标：既不该被判「启动慢」，也不该被淘汰
+clearSlowModels()
+recordSpeed('ttfb/12s', { ttfb: 12000, tps: 150 })
+const slow12 = buildTiers([{
+  id: 'ttfb/12s', provider: 'buddy', model: '12s', name: '12s',
+  rate: 0.1, free: false, vision: true, contextWindow: 1000000,
+}], { ...DEFAULTS, excludeBelowTps: 85 }).low
+check('首字 12s 的模型不被淘汰（在 15s 容忍范围内）',
+  slow12.some(row => row.id === 'ttfb/12s'), slow12.map(r => r.id).join(','))
+
+// 首字 16 秒：超过放弃阈值，应判为实测慢
+clearSlowModels()
+recordSpeed('ttfb/16s', { ttfb: 16000, tps: 150 })
+const slow16 = buildTiers([{
+  id: 'ttfb/16s', provider: 'buddy', model: '16s', name: '16s',
+  rate: 0.1, free: false, vision: true, contextWindow: 1000000,
+}], { ...DEFAULTS, excludeBelowTps: 0 }).low
+check('首字 16s 的模型被排到最后（超过 15s）',
+  slow16.length === 1, slow16.map(r => r.id).join(','))
+
 clearSlowModels()
 console.log(failures === 0 ? '\n全部通过' : '\n' + failures + ' 项失败')
 
