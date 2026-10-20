@@ -104,6 +104,14 @@ window.__ModuleLoader__.load({
         minTokensPerSecondHint: '输出低于这个速度就换下一个模型，并把它排到链尾；0 = 不判定',
         excludeBelowTps: '吞吐淘汰线（tokens/秒）',
         excludeBelowTpsHint: '实测吞吐低于这个值的模型直接移出全部链（等于取消选择）。点「重测全部」跑完后，四条链的勾选会自动收紧到通过这条线的模型；没测过的模型不受影响，0 = 不淘汰',
+        errorRateMax: '错误率淘汰线',
+        errorRateMaxHint: '真实请求错误率高于这个值的模型不进链（0.5 = 50%）。数据来自渠道包的 token 账本，是真实流量而非探测——实测 85–200 tok/s 那一档的错误率仍高达 53.7%，光看速度挡不住。0 = 关闭',
+        errorStatsMinSamples: '错误率判定最少样本',
+        errorStatsMinSamplesHint: '至少这么多次真实请求才下判断。样本太少时不下结论，避免误伤新上架或刚恢复的模型',
+        errorStatsDays: '错误率回看天数',
+        errorStatsDaysHint: '取账本里最近 N 天的统计；太久的故障不该永久压着一个模型',
+        errorStatsMinutes: '错误率缓存（分钟）',
+        errorStatsMinutesHint: '账本是日聚合，不需要频繁重读',
         fastBandSize: '快速档大小（同时轮换几个）',
         fastBandSizeHint: '只有吞吐最高的前 N 个模型参与轮流调用。档内轮流当链首，档外只在档内全失败时兜底。1 = 永远只用最快的那个',
         throughputBandTps: '吞吐分档档宽（tokens/秒）',
@@ -246,6 +254,14 @@ window.__ModuleLoader__.load({
         minTokensPerSecondHint: 'Slower than this and the chain moves on, demoting the model to the tail; 0 disables',
         excludeBelowTps: 'Throughput cut-off (tokens/s)',
         excludeBelowTpsHint: 'Models measured below this are removed from every chain. After a full re-measure, each chain is auto-narrowed to the models above this line. Unmeasured models are kept; 0 disables',
+        errorRateMax: 'Error-rate cut-off',
+        errorRateMaxHint: 'Models whose real request error rate is above this are removed (0.5 = 50%). Data comes from the channel pack token ledger (real traffic, not probes); the 85-200 tok/s band still shows 53.7% errors, so speed alone cannot filter them. 0 disables',
+        errorStatsMinSamples: 'Min samples for error rate',
+        errorStatsMinSamplesHint: 'Need at least this many real requests before judging, so a brand-new or just-recovered model is not condemned on one failure',
+        errorStatsDays: 'Error-rate lookback (days)',
+        errorStatsDaysHint: 'Use the last N days of the ledger; an old outage should not bench a model forever',
+        errorStatsMinutes: 'Error-rate cache (minutes)',
+        errorStatsMinutesHint: 'The ledger is a daily aggregate, so there is no need to re-read it often',
         fastBandSize: 'Fast band size (how many rotate)',
         fastBandSizeHint: 'Only the N fastest models rotate as chain head. The rest stay as fallback. 1 = always the single fastest',
         throughputBandTps: 'Throughput band width (tokens/s)',
@@ -1386,6 +1402,32 @@ window.__ModuleLoader__.load({
                 label: t('excludeBelowTps'), hint: t('excludeBelowTpsHint'),
                 value: config.excludeBelowTps, min: 0,
                 onCommit: value => save({ excludeBelowTps: value }),
+              }),
+              /**
+               * 错误率淘汰：与吞吐淘汰并列的**独立**理由。
+               *
+               * 实测发现光看速度挡不住「快但一半请求失败」的模型——85–200 tok/s
+               * 那一档的错误率仍高达 53.7%。所以这一项单独暴露出来，可调可关。
+               */
+              h(NumberField, {
+                label: t('errorRateMax'), hint: t('errorRateMaxHint'),
+                value: config.errorRateMax, min: 0, step: 0.05,
+                onCommit: value => save({ errorRateMax: value }),
+              }),
+              h(NumberField, {
+                label: t('errorStatsMinSamples'), hint: t('errorStatsMinSamplesHint'),
+                value: config.errorStatsMinSamples, min: 1, step: 5,
+                onCommit: value => save({ errorStatsMinSamples: value }),
+              }),
+              h(NumberField, {
+                label: t('errorStatsDays'), hint: t('errorStatsDaysHint'),
+                value: config.errorStatsDays, min: 1,
+                onCommit: value => save({ errorStatsDays: value }),
+              }),
+              h(NumberField, {
+                label: t('errorStatsMinutes'), hint: t('errorStatsMinutesHint'),
+                value: config.errorStatsMinutes, min: 1,
+                onCommit: value => save({ errorStatsMinutes: value }),
               }),
               h(NumberField, {
                 label: t('fastBandSize'), hint: t('fastBandSizeHint'),

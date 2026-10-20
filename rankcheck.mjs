@@ -7,6 +7,8 @@
  * 降级」这一层（请求期），这里验的是**候选选择与排序**（分层期），两者的
  * 输入与不变量完全不同。混在一起会让失败信息难以定位到底哪一层坏了。
  */
+import fs from 'node:fs'
+import path from 'node:path'
 import { isolate } from './testenv.mjs'
 
 /**
@@ -23,6 +25,7 @@ const {
     markSlow, markFast, recordSpeed, filterDropped, rankCandidates, throughputOf,
     planAccountOrder, resetAccountRotation, isSpeedFailure,
     speedOf, encodeMembers, toChatBody, estimateTps, countTokens, tierOf, isDropped,
+    errorVerdict, resetErrorStats,
 } = m
 
 let failures = 0
@@ -452,8 +455,8 @@ check('没测过的模型不算不达标', isDropped('cut/never-measured', 85, {
 //   - 反过来（放弃 < 降级）更糟：还没到降级线就先被放弃，
 //     降级判定永远不生效。
 
-check('首字等待上限默认 15000ms', DEFAULTS.firstTokenTimeoutMs === 15000, String(DEFAULTS.firstTokenTimeoutMs))
-check('「启动慢」阈值默认 15000ms', DEFAULTS.slowTtfbMs === 15000, String(DEFAULTS.slowTtfbMs))
+check('首字等待上限默认 10000ms', DEFAULTS.firstTokenTimeoutMs === 10000, String(DEFAULTS.firstTokenTimeoutMs))
+check('「启动慢」阈值默认 10000ms', DEFAULTS.slowTtfbMs === 10000, String(DEFAULTS.slowTtfbMs))
 check('放弃阈值 >= 降级阈值（否则降级永不生效）',
   DEFAULTS.firstTokenTimeoutMs >= DEFAULTS.slowTtfbMs,
   `${DEFAULTS.firstTokenTimeoutMs} >= ${DEFAULTS.slowTtfbMs}`)
@@ -465,7 +468,7 @@ const slow12 = buildTiers([{
   id: 'ttfb/12s', provider: 'buddy', model: '12s', name: '12s',
   rate: 0.1, free: false, vision: true, contextWindow: 1000000,
 }], { ...DEFAULTS, excludeBelowTps: 85 }).low
-check('首字 12s 的模型不被淘汰（在 15s 容忍范围内）',
+check('首字 12s 的模型被判启动慢（超过 10s 阈值）',
   slow12.some(row => row.id === 'ttfb/12s'), slow12.map(r => r.id).join(','))
 
 // 首字 16 秒：超过放弃阈值，应判为实测慢
@@ -477,6 +480,73 @@ const slow16 = buildTiers([{
 }], { ...DEFAULTS, excludeBelowTps: 0 }).low
 check('首字 16s 的模型被排到最后（超过 15s）',
   slow16.length === 1, slow16.map(r => r.id).join(','))
+
+// ── 11. 参数调优 + 错误率淘汰 ──────────────────────────────────────────
+//
+// 这一节的数据依据全部来自本机 9 天、19247 次真实请求的统计：
+//   首字 P50 2.4s / P90 4.3s；吞吐 P50 341 tps；
+//   真实输出 P50 90 / P75 159 token；错误率 >20% 的模型有 74 个。
+
+check('首字等待上限 10000ms', DEFAULTS.firstTokenTimeoutMs === 10000, String(DEFAULTS.firstTokenTimeoutMs))
+check('「启动慢」阈值与等待上限一致', DEFAULTS.slowTtfbMs === DEFAULTS.firstTokenTimeoutMs,
+  `${DEFAULTS.slowTtfbMs} vs ${DEFAULTS.firstTokenTimeoutMs}`)
+check('maxSlowSkips=1（换人代价 10s，而非 20s）', DEFAULTS.maxSlowSkips === 1, String(DEFAULTS.maxSlowSkips))
+check('expectedOutputTokens=200（真实中位输出 90 token）', DEFAULTS.expectedOutputTokens === 200, String(DEFAULTS.expectedOutputTokens))
+check('perProviderLinks=10（trae 有 23 个候选）', DEFAULTS.perProviderLinks === 10, String(DEFAULTS.perProviderLinks))
+check('absurdRate=2（池内倍率 P90 只有 1.4）', DEFAULTS.absurdRate === 2, String(DEFAULTS.absurdRate))
+check('errorRateMax=0.5 默认开启', DEFAULTS.errorRateMax === 0.5, String(DEFAULTS.errorRateMax))
+check('错误率最少样本 20', DEFAULTS.errorStatsMinSamples === 20, String(DEFAULTS.errorStatsMinSamples))
+
+// ── 错误率淘汰：三态（有数据且超标 / 有数据未超标 / 没数据）───────────
+//
+// 用 errorVerdict 的纯逻辑验证，不依赖真实账本——账本里有没有某个模型
+// 取决于用户当天用了什么，拿它做断言会变成「看运气」。
+
+/**
+ * 造一份临时账本，验证读取与判定。
+ *
+ * 账本路径是 `<DSH_HOME>/channel-pack/token-ledger.json`，本测试已由
+ * testenv 隔离到临时目录，所以可以随便写。
+ */
+const ledgerDir = path.join(process.env.DSH_HOME, 'channel-pack')
+fs.mkdirSync(ledgerDir, { recursive: true })
+const today = new Date().toISOString().slice(0, 10)
+fs.writeFileSync(path.join(ledgerDir, 'token-ledger.json'), JSON.stringify({
+  days: {
+    [today]: {
+      'direct|mock|mock-a|err-high': { requests: 100, errors: 80, ttftCount: 100, ttftSumMs: 200000 },
+      'direct|mock|mock-a|err-low': { requests: 100, errors: 5, ttftCount: 100, ttftSumMs: 200000 },
+      'direct|mock|mock-a|err-few': { requests: 3, errors: 3, ttftCount: 3, ttftSumMs: 6000 },
+      'direct|mock|mock-a|err-none': { requests: 100, errors: 0, ttftCount: 100, ttftSumMs: 200000 },
+    },
+  },
+}), 'utf8')
+resetErrorStats()
+
+const errOpt = {
+  errorRateMax: 0.5, errorStatsMinSamples: 20, errorStatsDays: 7, errorStatsMinutes: 30,
+}
+check('错误率 80% 且样本足够 → 淘汰',
+  errorVerdict('mock/err-high', errOpt)?.dropped === true,
+  JSON.stringify(errorVerdict('mock/err-high', errOpt)))
+check('错误率 5% → 不淘汰',
+  errorVerdict('mock/err-low', errOpt)?.dropped === false,
+  JSON.stringify(errorVerdict('mock/err-low', errOpt)))
+check('错误率 100% 但样本只有 3 次 → 不淘汰（防误伤）',
+  errorVerdict('mock/err-few', errOpt)?.dropped === false,
+  JSON.stringify(errorVerdict('mock/err-few', errOpt)))
+check('账本里没有的模型 → 返回 undefined（不下判断）',
+  errorVerdict('mock/not-in-ledger', errOpt) === undefined)
+check('errorRateMax=0 时关闭错误率淘汰',
+  errorVerdict('mock/err-high', { ...errOpt, errorRateMax: 0 }) === undefined)
+
+// 错误率淘汰是**独立**于速度门槛的：速度门槛关掉也照样生效
+check('速度门槛为 0 时，错误率淘汰仍然生效',
+  isDropped('mock/err-high', 0, errOpt) === true)
+check('错误率不超标时，速度门槛为 0 就不淘汰',
+  isDropped('mock/err-low', 0, errOpt) === false)
+
+resetErrorStats()
 
 clearSlowModels()
 console.log(failures === 0 ? '\n全部通过' : '\n' + failures + ' 项失败')

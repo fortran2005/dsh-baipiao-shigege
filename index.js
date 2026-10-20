@@ -61,10 +61,30 @@ export const DEFAULTS = Object.freeze({
   longContextMin: 1000000,
   /** 每层最多几个链接。 */
   maxLinks: 40,
-  /** 同一渠道在一层里最多几条，避免单渠道故障吃掉整层。 */
-  perProviderLinks: 6,
-  /** 倍率超过此值不参与（躲开 20x 这类坑）。 */
-  absurdRate: 5,
+  /**
+   * 同一渠道在一层里最多几条，避免单渠道故障吃掉整层。
+   *
+   * ## 为什么是 10（实测依据）
+   *
+   * 各渠道的 1M 候选数：trae 23 · lobsterai 17 · buddy 13 · qoder 13 ·
+   * workbuddy 12 · qodercn 10 · codearts 6 · minimax 2 · zcode 2。
+   *
+   * 6 会把 trae 的 23 个候选砍到 6 个——而 trae 是实测表现很好的渠道
+   * （首字中位 3.0s）。10 仍然能限制单渠道占比（链上限 40 时最多 25%），
+   * 但不会把好渠道的候选白白丢掉。
+   */
+  perProviderLinks: 10,
+  /**
+   * 倍率超过此值不参与（躲开 20x 这类坑）。
+   *
+   * ## 为什么是 2（实测依据）
+   *
+   * 池内倍率分布：P50 0.51 · P75 0.8 · P90 1.4 · 最大 20。
+   *
+   * 5 意味着允许比中位贵 10 倍的模型进链——等于没设。按 P90 = 1.4 看，
+   * 2 才是「不离谱」的上界：覆盖 92% 的模型，挡掉真正贵的。
+   */
+  absurdRate: 2,
   /** 是否优先消耗快过期的积分。 */
   preferExpiringCredits: true,
   /** 「快过期」的判定窗口（天）。 */
@@ -75,28 +95,31 @@ export const DEFAULTS = Object.freeze({
    * 实测重思考模型会在正文前先想 9 秒以上，而换一个模型可能 2 秒就开始答。
    * 超过这个时间还没有正文就放弃当前候选、换下一个。0 = 不限制。
    *
-   * ## 为什么是 15 秒
+   * ## 为什么是 10 秒（实测依据）
    *
-   * 用户的取值。取舍在于「等它想完」与「换一个更快的」：
+   * 本机 9 天、19247 次真实请求的统计：
    *
-   *   - 10 秒会砍掉一批「思考 10–14 秒、但一旦开答就很快」的推理模型；
-   *   - 15 秒覆盖了绝大多数正常的重思考模型（实测最慢的稳定可用模型首字
-   *     约 11–12 秒），同时仍然能在病态模型上及时止损。
+   *   P50 2.4s · P75 3.4s · P90 4.3s · P95 5.2s
+   *   <=8s 覆盖 97.1%，<=10s 同样 97.1%，<=15s 才 97.5%
+   *
+   * 也就是说 **10 秒已经覆盖了几乎所有正常请求**，放宽到 15 秒只多覆盖
+   * 0.4%——那 0.4% 全是 codearts / qoder 的异常样本（中位首字 22–71 秒，
+   * 但错误率很低，是**排队/限流**而不是「思考」）。为它们多等 5 秒不划算：
+   * 卡死时每个候选都要多付 5 秒，而 maxSlowSkips 会连续放弃多个候选。
    *
    * 注意它和下面的 `slowTtfbMs` 是两件事：这里是**放弃**阈值（超过就换人），
    * 那里是**降级**阈值（答出来了但太慢，下轮排后面）。放弃阈值必须 >= 降级阈值，
    * 否则会出现「还没到降级线就先被放弃」——等于降级判定永远不生效。
    */
-  firstTokenTimeoutMs: 15000,
+  firstTokenTimeoutMs: 10000,
   /**
    * 首字延迟超过这个毫秒数的模型标记为「启动慢」，下轮排到链尾。
    *
-   * 与 `firstTokenTimeoutMs` 同步为 15 秒：既然愿意等 15 秒，那 12 秒出字的
-   * 模型就不该被记成「启动慢」——它只是慢一点，还在容忍范围内。若这里仍留
-   * 10 秒，会出现「等满 12 秒拿到答案、却被判定为启动慢而下次排到链尾」的
-   * 自相矛盾行为。
+   * 与 `firstTokenTimeoutMs` 同步：既然愿意等 10 秒，那 8 秒出字的模型就不该
+   * 被记成「启动慢」——它只是慢一点，还在容忍范围内。若这里比等待上限还大，
+   * 会出现「等满拿到答案、却被判定为启动慢而下次排到链尾」的自相矛盾行为。
    */
-  slowTtfbMs: 15000,
+  slowTtfbMs: 10000,
   /**
    * 单次请求最多因为「首字太慢」放弃几个候选。
    *
@@ -107,9 +130,17 @@ export const DEFAULTS = Object.freeze({
    * 一个 11.6 秒的慢模型还慢**。超时本来是为了更快，失控时反而成了放大器。
    *
    * 上限的作用是把这个代价钉死：最多放弃 N 个，之后就老老实实等当前候选
-   * 出结果。默认 2 —— 足够跳过最差的一两个，又不会把时间浪费在连续重试上。
+   * 出结果。
+   *
+   * ## 为什么是 1（而不是 2）
+   *
+   * 这个代价是「首字超时 × 放弃个数」：首字上限 10 秒时，放弃 2 个 = **最坏
+   * 20 秒**才轮到第 3 个候选。而本机实测 P90 首字只有 4.3 秒——20 秒的换人
+   * 代价是 P90 的 4.6 倍，已经远超「换一个更快的」能省下的时间。
+   *
+   * 1 次的意思是：只给一次「换人」的机会，之后老实等当前候选跑完。
    */
-  maxSlowSkips: 2,
+  maxSlowSkips: 1,
   /**
    * 是否向渠道包查询积分余额。
    *
@@ -158,6 +189,27 @@ export const DEFAULTS = Object.freeze({
    * 前提是「测出来慢」，而不是「还没测」——否则启动瞬间所有模型都会被清空。
    */
   excludeBelowTps: 85,
+  /**
+   * 错误率淘汰：真实请求错误率高于这个值的模型不进链。
+   *
+   * 依据是渠道包的 token 账本（真实流量，不是我们的探测）。实测有 74 个模型
+   * 错误率 > 20%，其中一批是 100%——而按吞吐分组看，85–200 tps 那一档的
+   * 错误率仍高达 53.7%，**速度淘汰线完全挡不住它们**。
+   *
+   * 0 = 关闭（不按错误率淘汰）。
+   */
+  errorRateMax: 0.5,
+  /**
+   * 错误率判定的最少样本数。
+   *
+   * 一次失败就判死是典型的误伤：新上架、或刚恢复的模型可能只有两三个请求。
+   * 20 次是「足够看出趋势」与「不至于让新模型等太久」的折中。
+   */
+  errorStatsMinSamples: 20,
+  /** 错误率统计回看多少天（取账本里最近的 N 天）。 */
+  errorStatsDays: 7,
+  /** 错误率统计的缓存时长（分钟）；账本是日聚合，不需要频繁重读。 */
+  errorStatsMinutes: 30,
   /**
    * 吞吐分档的档宽（tokens/s）。
    *
@@ -265,8 +317,18 @@ export const DEFAULTS = Object.freeze({
    * 估算吞吐时的预期输出 token 数。
    *
    * 越大越偏向高吞吐模型（长回答场景）；越小越偏向首字快的模型（短问答）。
+   *
+   * ## 为什么是 200（实测依据）
+   *
+   * 本机真实每请求输出量：P50 90 · P75 159 · P90 351 token。
+   *
+   * 800 会让排序**过度偏向高吞吐模型**：按 800 token 算，生成段要 4–9 秒，
+   * 与首字（实测 P50 2.4s / P90 4.3s）同量级；但真实中位输出只有 90 token，
+   * 生成段不到 1 秒——**首字延迟才是体感的主要部分**。
+   *
+   * 200 取 P50 与 P75 之间：既照顾到中位场景，又不至于让长回答完全失去权重。
    */
-  expectedOutputTokens: 800,
+  expectedOutputTokens: 200,
   /**
    * Custom 链的选法。
    *
@@ -373,6 +435,18 @@ try {
     excludeBelowTps: Schema.number()
       .default(DEFAULTS.excludeBelowTps)
       .description('实测吞吐低于这个值（tokens/s）的模型不进任何链（等于「取消选择」）；没测过的不受影响，0 = 不淘汰'),
+    errorRateMax: Schema.number()
+      .default(DEFAULTS.errorRateMax)
+      .description('真实请求错误率高于这个值的模型不进链（0.5 = 50%）；数据来自渠道包的 token 账本，0 = 不按错误率淘汰'),
+    errorStatsMinSamples: Schema.number()
+      .default(DEFAULTS.errorStatsMinSamples)
+      .description('错误率判定至少需要多少次真实请求（样本太少时不下判断，避免误伤新模型）'),
+    errorStatsDays: Schema.number()
+      .default(DEFAULTS.errorStatsDays)
+      .description('错误率回看多少天（取账本里最近的 N 天）'),
+    errorStatsMinutes: Schema.number()
+      .default(DEFAULTS.errorStatsMinutes)
+      .description('错误率统计的缓存时长（分钟）'),
     fastBandSize: Schema.number()
       .default(DEFAULTS.fastBandSize)
       .description('只有吞吐最高的前 N 个模型参与轮流调用；档外模型仍可兜底，1 = 永远只用最快的'),
@@ -1550,6 +1624,11 @@ export function buildTiers(rows, config) {
     speedMemoryMinutes: config.speedMemoryMinutes,
     slowMemoryMinutes: config.slowMemoryMinutes,
     excludeBelowTps: config.excludeBelowTps,
+    // 错误率淘汰：与速度淘汰并列，都是「不该进链」的理由
+    errorRateMax: config.errorRateMax,
+    errorStatsMinSamples: config.errorStatsMinSamples,
+    errorStatsDays: config.errorStatsDays,
+    errorStatsMinutes: config.errorStatsMinutes,
   })
   /**
    * 淘汰 + 排序，一步到位。
@@ -2097,6 +2176,112 @@ export function speedOf(modelId, options = {}) {
   }
 }
 
+// ── 真实请求错误率 ──────────────────────────────────────────────────────────
+
+/**
+ * 从渠道包的 **token 账本**读每个模型的真实请求错误率。
+ *
+ * ## 为什么需要它（这是纯速度指标挡不住的盲区）
+ *
+ * 本机 9 天账本里，有 74 个模型错误率 > 20%，其中一批是 **100%**：
+ *
+ *   codearts/deepseek-v4-pro      100%  (n=98)
+ *   workbuddy/gemini-3.8-flash    100%  (n=108)
+ *   qoder/efficient               100%  (n=174)
+ *
+ * 而按吞吐分组看：
+ *
+ *   0–85 tps    52 个模型   错误率 54.4%
+ *   85–200 tps  34 个模型   错误率 53.7%   ← 淘汰线挡不住
+ *   200–400 tps 10 个模型   错误率  2.5%
+ *
+ * 也就是说「能吐字、吐得不慢」和「请求能成功」是两件独立的事。只按速度淘汰，
+ * 会把一批「速度快但一半以上请求直接失败」的模型留在链首。
+ *
+ * ## 数据从哪来
+ *
+ * `~/.dsh/channel-pack/token-ledger.json` 是渠道包自己记的日聚合，每条是
+ * 「天 × 渠道|账号|模型」，字段里有 `requests` 与 `errors`。这是**真实流量**
+ * 的统计（不是我们的探测），所以最能代表实际可用性。
+ *
+ * 读不到就返回空表——这个功能是可选增强，绝不能让插件依赖渠道包的文件。
+ */
+let errorStatsCache = { at: 0, data: new Map() }
+
+export function errorStatsOf(modelId, options = {}) {
+  const ttlMs = positive(options.errorStatsMinutes, DEFAULTS.errorStatsMinutes) * 60_000
+  if (Date.now() - errorStatsCache.at > ttlMs) {
+    errorStatsCache = { at: Date.now(), data: readErrorStats() }
+  }
+  return errorStatsCache.data.get(String(modelId ?? "").toLowerCase())
+}
+
+/** 读账本并聚合成「模型 → {requests, errors, rate}」。 */
+function readErrorStats() {
+  const out = new Map()
+  try {
+    const file = path.join(dshHome(), "channel-pack", "token-ledger.json")
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"))
+    const days = Object.keys(raw?.days ?? {})
+    /** 只统计最近 N 天，避免很久以前的故障永久压着模型。 */
+    const keep = days.slice(-DEFAULTS.errorStatsDays)
+    const acc = new Map()
+    for (const day of keep) {
+      for (const [key, value] of Object.entries(raw.days[day] ?? {})) {
+        const parts = String(key).split("|")
+        if (parts.length < 3) continue
+        const provider = parts[1]
+        const model = parts[parts.length - 1]
+        if (provider === "" || model === "") continue
+        const id = `${provider}/${model}`.toLowerCase()
+        const cur = acc.get(id) ?? { requests: 0, errors: 0 }
+        cur.requests += Number(value?.requests) || 0
+        cur.errors += Number(value?.errors) || 0
+        acc.set(id, cur)
+      }
+    }
+    for (const [id, v] of acc) {
+      if (v.requests <= 0) continue
+      out.set(id, {
+        requests: v.requests,
+        errors: v.errors,
+        /** 错误率 0–1。 */
+        rate: v.errors / v.requests,
+      })
+    }
+  } catch { /* 账本不存在或损坏：当作「没有数据」，不淘汰任何模型 */ }
+  return out
+}
+
+/** 清空错误率缓存（测试缝）。 */
+export function resetErrorStats() {
+  errorStatsCache = { at: 0, data: new Map() }
+}
+
+/**
+ * 这个模型是否该因为**错误率**被淘汰。
+ *
+ * 两条闸，缺一不可：
+ *
+ *   1. **样本量够**（`requests >= errorStatsMinSamples`）。一次失败就判死是
+ *      典型的误伤——新上架或刚恢复的模型可能只有两三个请求。
+ *   2. **错误率超过阈值**（`errorRateMax`）。
+ *
+ * 返回 `undefined` 表示「没有数据，无法判断」——与「不该淘汰」区分开，
+ * 让调用方能按需决定（我们一律**不淘汰**，宁可留着也不误杀）。
+ *
+ * @returns {{requests:number, errors:number, rate:number, dropped:boolean}|undefined}
+ */
+export function errorVerdict(id, options = {}) {
+  const max = Number(options.errorRateMax)
+  if (!Number.isFinite(max) || max <= 0) return undefined
+  const minSamples = Math.max(1, Math.trunc(Number(options.errorStatsMinSamples) || 0))
+  const stat = errorStatsOf(id, options)
+  if (stat === undefined) return undefined
+  const enough = stat.requests >= minSamples
+  return { ...stat, dropped: enough && stat.rate > max }
+}
+
 /** 记录一次「这个模型慢」（与速度画像并存，供设置页展示）。 */
 export function markSlow(modelId, at = Date.now()) {
   const previous = slowModels.get(modelId)
@@ -2223,6 +2408,17 @@ export function filterDropped(list, options = {}) {
  * @returns {boolean}
  */
 export function isDropped(id, cut, options = {}) {
+  /**
+   * ## 错误率优先于速度
+   *
+   * 一个错误率 100% 的模型，速度再快也没有意义——它根本答不出来。所以先判
+   * 错误率，再判速度。
+   *
+   * 这里**不看 `cut`**（速度门槛）：即使把速度淘汰关掉（`cut = 0`），
+   * 错误率淘汰仍应生效——它是独立的一项。
+   */
+  const verdict = errorVerdict(id, options)
+  if (verdict !== undefined && verdict.dropped) return true
   /**
    * ## 门槛 <= 0 表示「彻底关掉淘汰」
    *
@@ -3637,6 +3833,10 @@ export function apply(ctx, rawConfig) {
         const isOut = isDropped(id, cut, {
           speedMemoryMinutes: config.speedMemoryMinutes,
           slowMemoryMinutes: config.slowMemoryMinutes,
+          errorRateMax: config.errorRateMax,
+          errorStatsMinSamples: config.errorStatsMinSamples,
+          errorStatsDays: config.errorStatsDays,
+          errorStatsMinutes: config.errorStatsMinutes,
         })
         /**
          * 还想区分「真的低于门槛」与「没测出」——用 `speedOf` 的画像判断：
@@ -3905,7 +4105,13 @@ export function apply(ctx, rawConfig) {
       excludeBelowTps: config.excludeBelowTps,
       speedMemoryMinutes: config.speedMemoryMinutes,
       slowMemoryMinutes: config.slowMemoryMinutes,
+      errorRateMax: config.errorRateMax,
+      errorStatsMinSamples: config.errorStatsMinSamples,
+      errorStatsDays: config.errorStatsDays,
+      errorStatsMinutes: config.errorStatsMinutes,
     }).length === 0,
+    /** 真实请求错误率（来自渠道包账本）；没数据时 undefined。 */
+    errorRate: errorStatsOf(row.id, { errorStatsMinutes: config.errorStatsMinutes })?.rate,
   })
 
   /**
@@ -4063,9 +4269,19 @@ export function apply(ctx, rawConfig) {
         excludeBelowTps: cut,
         speedMemoryMinutes: config.speedMemoryMinutes,
         slowMemoryMinutes: config.slowMemoryMinutes,
+        errorRateMax: config.errorRateMax,
+        errorStatsMinSamples: config.errorStatsMinSamples,
+        errorStatsDays: config.errorStatsDays,
+        errorStatsMinutes: config.errorStatsMinutes,
       }).length) {
         const speed = speedOf(row.id, { speedMemoryMinutes: config.speedMemoryMinutes })
-        out.push({ id: row.id, tps: Number.isFinite(Number(speed?.tps)) ? Number(speed.tps) : null })
+        const err = errorStatsOf(row.id, { errorStatsMinutes: config.errorStatsMinutes })
+        out.push({
+          id: row.id,
+          tps: Number.isFinite(Number(speed?.tps)) ? Number(speed.tps) : null,
+          /** 真实请求错误率；有值说明这条可能是因为它被淘汰的。 */
+          errorRate: err?.rate ?? null,
+        })
       }
     }
     // 最慢的排前面：用户想看的正是「哪些被砍了、有多慢」。
@@ -4128,6 +4344,10 @@ export function apply(ctx, rawConfig) {
       maxSlowSkips: config.maxSlowSkips,
       minTokensPerSecond: config.minTokensPerSecond,
       excludeBelowTps: config.excludeBelowTps,
+      errorRateMax: config.errorRateMax,
+      errorStatsMinSamples: config.errorStatsMinSamples,
+      errorStatsDays: config.errorStatsDays,
+      errorStatsMinutes: config.errorStatsMinutes,
       fastBandSize: config.fastBandSize,
       throughputBandTps: config.throughputBandTps,
       probeOnStartup: config.probeOnStartup !== false,
@@ -4513,6 +4733,10 @@ export function apply(ctx, rawConfig) {
         speedMemoryMinutes: config.speedMemoryMinutes,
         slowMemoryMinutes: config.slowMemoryMinutes,
         excludeBelowTps: config.excludeBelowTps,
+        errorRateMax: config.errorRateMax,
+        errorStatsMinSamples: config.errorStatsMinSamples,
+        errorStatsDays: config.errorStatsDays,
+        errorStatsMinutes: config.errorStatsMinutes,
       })
       /**
        * 先把「实测慢」的候选沉到链尾，再决定起点。
@@ -4597,7 +4821,7 @@ export function apply(ctx, rawConfig) {
       throw Object.assign(new Error('settings must be a JSON object'), { statusCode: 400 })
     }
     const next = { ...config }
-    const numeric = ['refreshMinutes', 'lowMaxRate', 'longContextMin', 'maxLinks', 'perProviderLinks', 'absurdRate', 'expiringWindowDays', 'firstTokenTimeoutMs', 'slowTtfbMs', 'maxSlowSkips', 'minTokensPerSecond', 'excludeBelowTps', 'fastBandSize', 'throughputBandTps', 'startupProbeSkipMinutes', 'accountReorderMinutes', 'speedSampleMs', 'slowMemoryMinutes', 'speedMemoryMinutes', 'expectedOutputTokens']
+    const numeric = ['refreshMinutes', 'lowMaxRate', 'longContextMin', 'maxLinks', 'perProviderLinks', 'absurdRate', 'expiringWindowDays', 'firstTokenTimeoutMs', 'slowTtfbMs', 'maxSlowSkips', 'minTokensPerSecond', 'excludeBelowTps', 'errorRateMax', 'errorStatsMinSamples', 'errorStatsDays', 'errorStatsMinutes', 'fastBandSize', 'throughputBandTps', 'startupProbeSkipMinutes', 'accountReorderMinutes', 'speedSampleMs', 'slowMemoryMinutes', 'speedMemoryMinutes', 'expectedOutputTokens']
     for (const key of numeric) {
       if (!Object.hasOwn(patch, key)) continue
       const raw = patch[key]
