@@ -1,0 +1,11 @@
+# dsh-baipiao-stone bundle patch.
+#
+# 一行 insert 即挂载。name 是裸包名，从 profile 自己的 node_modules 解析。
+#
+# config 故意留空：所有设置项由 index.js 导出的 `Config` schema 声明，
+# 内核的 settings-controller 会读 `schema.toJSON()` 自动为它生成设置页表单，
+# 用户改过的值再写回这一行的 config。
+- insert:
+    - id: baipiao-stone
+      name: dsh-baipiao-shigege
+      config: {}
