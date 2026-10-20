@@ -1,0 +1,56 @@
+{
+  "name": "dsh-baipiao-shigege",
+  "version": "0.1.0",
+  "description": "把白嫖渠道的模型按「免费 / 低积分 / 高积分」自动分成三条 1M 降级链，另加一条自定义链；按实测吞吐排序，倍率变化时自动重新分层。",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "sse.js",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "llm",
+    "fallback-chain",
+    "model-router"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js",
+    "selftest": "node selftest.mjs",
+    "tiercheck": "node tiercheck.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
