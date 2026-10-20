@@ -42,6 +42,8 @@ window.__ModuleLoader__.load({
         creditsLeft: '可用积分',
         creditsExpiring: '其中快到期',
         creditsUpdating: '可用积分（更新中…）',
+        creditsStale: '已重新分层；本轮余额查询未成功，积分沿用上次的数值',
+        creditsStillUpdating: '已重新分层；余额查询仍在进行，稍后会自动更新',
         creditsQuota: '另有 {n} 个额度型渠道（按天给额度，不计入积分）',
         refreshing: '正在重新分层…',
         statusOk: '上次分层：{time}',
@@ -132,6 +134,10 @@ window.__ModuleLoader__.load({
         customModels: '自定义模型（逗号分隔）',
         customModelsHint: '从 13 个平台挑模型 id 填进来，只进 Custom 链、不进自动分层；改名/下架的会自动移除',
         searchModels: '搜索模型…',
+        searchModelsInChain: '在本链里搜索模型…',
+        clearSearch: '清除搜索',
+        searchMatched: '匹配 {n} 个',
+        searchNoMatch: '没有匹配的模型',
         addToCustom: '加入',
         removeFromCustom: '移出',
       },
@@ -145,6 +151,8 @@ window.__ModuleLoader__.load({
         creditsLeft: 'credits left',
         creditsExpiring: 'expiring soon',
         creditsUpdating: 'credits left (updating…)',
+        creditsStale: 'Re-tiered; this balance refresh failed, credits kept from the last successful one',
+        creditsStillUpdating: 'Re-tiered; the balance refresh is still running and will update shortly',
         creditsQuota: '+{n} quota-based channels (daily allowance, not counted)',
         refreshing: 'Re-tiering…',
         statusOk: 'Last tiered: {time}',
@@ -241,6 +249,10 @@ window.__ModuleLoader__.load({
         customModels: 'Custom models (comma-separated)',
         customModelsHint: 'Pick model ids from the platforms; they only go into Custom, never auto-tiered; renamed ones auto-removed',
         searchModels: 'Search models…',
+        searchModelsInChain: 'Search models in this chain…',
+        clearSearch: 'Clear search',
+        searchMatched: '{n} matched',
+        searchNoMatch: 'No matching models',
         addToCustom: 'Add',
         removeFromCustom: 'Remove',
       },
@@ -320,6 +332,20 @@ window.__ModuleLoader__.load({
 .bps_speedslow{color:#E36AA6;}
 .bps_check{display:flex;align-items:center;gap:7px;font-size:12.5px;cursor:pointer;}
 .bps_hint{margin:0;font-size:11px;line-height:1.55;color:var(--dsw-alias-label-tertiary);}
+/* 链内搜索：一条细搜索行，不抢卡片本身的视觉重心。 */
+.bps_csearchrow{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.bps_csearch{box-sizing:border-box;flex:1;min-width:0;border:1px solid var(--dsw-alias-border-l1);
+  background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);
+  border-radius:7px;padding:4px 9px;font:inherit;font-size:11.5px;}
+.bps_csearch:focus{outline:2px solid color-mix(in srgb,var(--dsw-alias-state-business-primary) 45%,transparent);
+  outline-offset:1px;border-color:transparent;}
+.bps_csearch::placeholder{color:var(--dsw-alias-label-tertiary);}
+.bps_csearchclear{flex:0 0 auto;border:0;background:transparent;color:var(--dsw-alias-label-tertiary);
+  cursor:pointer;font-size:15px;line-height:1;padding:2px 5px;border-radius:5px;}
+.bps_csearchclear:hover{color:var(--dsw-alias-label-primary);
+  background:var(--dsw-alias-bg-layer-2);}
+.bps_csearchhint{flex:0 0 auto;font-size:10.5px;color:var(--dsw-alias-label-tertiary);
+  font-variant-numeric:tabular-nums;}
 .bps_stats{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline;
   padding:10px 13px;border-radius:10px;border:1px solid var(--dsw-alias-border-l1);
   background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 55%,transparent);}
@@ -396,8 +422,11 @@ window.__ModuleLoader__.load({
         clearSlow: () => call('/slow/clear', { method: 'POST', body: '{}' }),
         // 单模型勾选 / 取消：立即保存。
         toggleMember: (key, id, checked) => call('/chain/toggle', { method: 'POST', body: JSON.stringify({ key, id, checked }) }),
-        // 整条链全选 / 全不选。
-        toggleAll: (key, checked) => call('/chain/all', { method: 'POST', body: JSON.stringify({ key, checked }) }),
+        // 全选 / 全不选。`ids` 存在时只对这几个模型生效（搜索后的批量操作）。
+        toggleAll: (key, checked, ids) => call('/chain/all', {
+          method: 'POST',
+          body: JSON.stringify(ids === undefined ? { key, checked } : { key, checked, ids }),
+        }),
         // 速度探测：开跑 / 查进度 / 停止。
         probe: force => call('/probe', { method: 'POST', body: JSON.stringify({ force }) }),
         probeStatus: () => call('/probe/status'),
@@ -511,9 +540,33 @@ window.__ModuleLoader__.load({
       const links = Array.isArray(chain?.links) ? chain.links : []
       const accent = typeof color === 'string' && color !== '' ? color : undefined
       const list = Array.isArray(options) ? options : []
+      /**
+       * 本卡片的搜索词。
+       *
+       * 纯本地状态：每条链的候选集不同，搜索词天然是各自局部的；刷新 state
+       * 不会重置它（组件没卸载），用户搜完连点几个复选框不会被打断。
+       */
+      const [query, setQuery] = useState('')
+      const needle = query.trim().toLowerCase()
+      const filtering = needle !== ''
+      /**
+       * 筛选结果。
+       *
+       * 匹配完整 id（含 provider 前缀），这样 glm、trae/glm、trae 都能
+       * 命中——用户不需要记住是不是要带渠道名前缀。
+       */
+      const filtered = filtering
+        ? list.filter(row => String(row.id).toLowerCase().includes(needle))
+        : list
       const isOn = row => selected.has(String(row.id).toLowerCase())
-      const allOn = list.length > 0 && list.every(isOn)
-      const someOn = list.some(isOn)
+      /**
+       * 全选复选框的勾选状态**基于筛选结果**。
+       *
+       * 搜索时它回答的是「搜出来的这些是不是都选了」，而不是「整条链是不是
+       * 都选了」——后者在搜索场景下没有意义，还会误导。
+       */
+      const allOn = filtered.length > 0 && filtered.every(isOn)
+      const someOn = filtered.some(isOn)
       return h('div', {
         className: 'bps_card',
         style: accent === undefined ? undefined : { borderLeftColor: accent },
@@ -524,21 +577,57 @@ window.__ModuleLoader__.load({
             type: 'checkbox', checked: allOn, disabled: busy,
             // indeterminate 由 ref 设置：它表示「部分选中」，比显示未选中更诚实。
             ref: el => { if (el != null) el.indeterminate = someOn && !allOn },
-            onChange: () => onToggleAll(!allOn),
+            // 搜索时把筛选结果一并带上：后端据此只动这几个，不碰整条链。
+            onChange: () => onToggleAll(!allOn, filtering ? filtered.map(row => row.id) : undefined),
           }),
           h('span', { className: 'bps_cardname', style: accent === undefined ? undefined : { color: accent } },
             accent === undefined ? null : h('span', { className: 'bps_dot', style: { background: accent } }),
             name)),
-        h('span', { className: 'bps_count' }, `${links.length}/${list.length}`)),
+        h('span', { className: 'bps_count' }, filtering
+          ? `${filtered.filter(isOn).length}/${filtered.length}`
+          : `${links.length}/${list.length}`)),
 
       h('div', { className: 'bps_cap' },
         h('span', { className: 'bps_tag' }, `${t('context')} ≥${humanContext(chain?.contextWindow)}`),
         h('span', { className: 'bps_tag' }, `${t('image')}: ${chain?.vision === true ? t('yes') : t('no')}`)),
 
+      /**
+       * 搜索行。
+       *
+       * 只在有候选时出现——空链上放一个搜索框毫无意义。候选不多时也保留，
+       * 因为「少数几个里定位」和「批量改」的诉求是一样的。
+       */
+      list.length === 0 ? null : h('div', { className: 'bps_csearchrow' },
+        h('input', {
+          type: 'search',
+          className: 'bps_csearch',
+          value: query,
+          placeholder: t('searchModelsInChain'),
+          disabled: busy,
+          'aria-label': t('searchModelsInChain'),
+          onChange: event => setQuery(event.target.value),
+        }),
+        filtering
+          ? h('button', {
+            type: 'button',
+            className: 'bps_csearchclear',
+            disabled: busy,
+            onClick: () => setQuery(''),
+            title: t('clearSearch'),
+            'aria-label': t('clearSearch'),
+          }, '×')
+          : null,
+        filtering
+          ? h('span', { className: 'bps_csearchhint' },
+            t('searchMatched').replace('{n}', String(filtered.length)))
+          : null),
+
       list.length === 0
         ? h('p', { className: 'bps_note' }, t('empty'))
-        : h('ul', { className: 'bps_list bps_checklist' },
-          list.map(row => {
+        : filtered.length === 0
+          ? h('p', { className: 'bps_note' }, t('searchNoMatch'))
+          : h('ul', { className: 'bps_list bps_checklist' },
+            filtered.map(row => {
             const on = isOn(row)
             return h('li', { key: row.id, className: 'bps_checkrow' },
               h('label', { className: 'bps_check' },
@@ -555,7 +644,7 @@ window.__ModuleLoader__.load({
                     : (Number.isFinite(row.speed?.ttfb) ? 'bps_speed bps_speedfast' : 'bps_speed'),
                 }, formatSpeed(row.speed)),
                 h('span', { className: 'bps_rate' }, formatRate(row.rate))))
-          })))
+            })))
     }
 
     /**
@@ -782,10 +871,20 @@ window.__ModuleLoader__.load({
           if (generation !== creditsWatch) return
           setState(snapshot)
           if (snapshot?.status?.creditsPending !== true) {
-            if (Number(snapshot?.status?.creditsAt ?? 0) > before) setNotice(t('saved'))
+            /**
+             * 收尾文案要区分「真的刷新了」和「这轮没拿到」。
+             *
+             * 宿主只在确实拿到新余额时才推进 `creditsAt`，所以时间戳没动就
+             * 说明这一轮所有渠道都查询失败、数字仍是旧的。此时提示「已保存」
+             * 会让用户以为积分已经更新，实际看到的是上一轮的数值。
+             */
+            const advanced = Number(snapshot?.status?.creditsAt ?? 0) > before
+            setNotice(advanced ? t('saved') : t('creditsStale'))
             return
           }
         }
+        // 轮询到上限仍在更新中：明确告知，而不是静默停在一个「更新中」的标签。
+        if (generation === creditsWatch) setNotice(t('creditsStillUpdating'))
       }
 
       // 与宿主侧 parseCustomModels 同口径：逗号/空格/分号分隔、去重、小写。
@@ -905,11 +1004,20 @@ window.__ModuleLoader__.load({
         } finally { setBusy(false) }
       }
 
-      /** 整条链全选 / 全不选。 */
-      const toggleAllMembers = async (key, on) => {
+      /**
+       * 全选 / 全不选。
+       *
+       * @param {string} key - 链名
+       * @param {boolean} on - true 全选，false 全不选
+       * @param {string[]} [ids] - 只对这些 id 生效；省略表示整条链
+       *
+       * 带 `ids` 时语义是「把这几个加入 / 移出」，而不是「整链置为全选」。
+       * 两者差别在搜索场景下很关键：搜到 3 个点全选，不该把另外 93 个也选中。
+       */
+      const toggleAllMembers = async (key, on, ids) => {
         setBusy(true); setNotice(''); setError('')
         try {
-          await api.toggleAll(key, on)
+          await api.toggleAll(key, on, ids)
           await refreshBoth()
         } catch (caught) {
           setError(t('saveFailed').replace('{reason}', String(caught?.message ?? caught)))
@@ -1001,8 +1109,9 @@ window.__ModuleLoader__.load({
             selected: new Set(membersOf(key, state, config).map(x => String(x).toLowerCase())),
             // 单模型切换：立即提交、立即落盘，没有保存按钮。
             onToggleOption: (id, on) => toggleMember(key, id, on),
-            // 链头全选 / 全不选。
-            onToggleAll: on => toggleAllMembers(key, on),
+            // 链头全选 / 全不选。第二个参数是「只对这些 id 生效」，
+            // 搜索框有内容时由卡片传入筛选结果。
+            onToggleAll: (on, ids) => toggleAllMembers(key, on, ids),
           }))),
 
         h('div', { className: 'bps_section' },
