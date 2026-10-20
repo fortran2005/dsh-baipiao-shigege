@@ -1,8 +1,19 @@
 // 速度门槛与慢模型降级的单元验证。
-import {
-  estimateTps, markSlow, markFast, isSlow, clearSlowModels, demoteSlow,
-  buildTiers, DEFAULTS, resetRotation,
-} from './index.js'
+import { isolate } from './testenv.mjs'
+
+/**
+ * 动态导入：**必须在 `isolate()` 之后**。
+ *
+ * 静态 import 会被提升到模块求值之前，那时 `DSH_HOME` 还没指向临时目录，
+ * 生产模块的 `dshHome()` 就会解析到真实的 `~/.dsh`——而这些脚本会调用
+ * `clearSlowModels()`，它把空的画像**直接写进那个真实文件**。
+ */
+const m = await isolate()
+const {
+    
+    estimateTps, markSlow, markFast, isSlow, clearSlowModels, demoteSlow,  
+    buildTiers, DEFAULTS, resetRotation,
+} = m
 
 let failures = 0
 const check = (label, ok, detail = '') => {

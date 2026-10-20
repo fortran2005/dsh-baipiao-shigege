@@ -2,7 +2,7 @@
 
 把白嫖渠道的模型按价格自动分成三条 **1M 降级链**，另加一条自己挑的 **Custom 链**；四条链都按**实测吞吐从大到小**排序，慢于门槛的模型直接出局。
 
-> DeepSeek Harness (DSH) 插件 · 版本 0.1.1 · MIT
+> DeepSeek Harness (DSH) 插件 · 版本 0.2.1 · MIT
 
 ---
 
@@ -232,7 +232,7 @@ git clone <repo-url> ~/.dsh/profiles/desktop/node_modules/dsh-baipiao-shigege
 
 | 项 | 默认 | 说明 |
 |---|---|---|
-| Custom 严格按勾选 | 开 | 开启后链**严格等于**勾选清单；关闭则整个候选池都进链 |
+| Custom 严格按勾选 | **关**（跟随候选池） | 开启后链**严格等于**勾选清单；关闭则整个候选池都进链。你在 Custom 里动过任何复选框后会自动切到「严格」 |
 
 勾选与取消**立即保存**，没有「保存」按钮。取消某个模型后它仍然留在候选列表里（只是复选框没勾），随时可以再勾回来。
 
@@ -300,12 +300,18 @@ cd <插件目录> && node relink.mjs    # 内置 fixPeerResolution 会建好联�
 node --check index.js && node --check client.js   # 语法门禁
 node selftest.mjs                                  # 自检
 node tiercheck.mjs                                 # 分层逻辑
-node speedcheck.mjs                                # 速度门槛与降级
+node speedcheck.mjs                                # 速度门槛与慢模型降级
 node rankcheck.mjs                                 # 吞吐排序 / 淘汰 / 快速档 / 账号排序
 node hostcheck.mjs                                 # 宿主接口（需要网关在线）
 ```
 
-> 这些脚本默认读 `~/.dsh/openai-gateway/api-key`。仓库内的 `.runtime-data/` 是一份隔离的测试用 `DSH_HOME`；想用真实网关时加 `DSH_HOME=~/.dsh`。
+**测试不会碰你的真实数据**：`speedcheck.mjs` 与 `rankcheck.mjs` 通过 `testenv.mjs`
+把 `DSH_HOME` 指向一个临时目录，跑完即删。这一点是必须的——它们会调用
+`clearSlowModels()`，而那个函数默认会**落盘**；早先没有隔离时，跑一次
+`node speedcheck.mjs` 就会把你积累的速度画像与慢模型记忆整份清空。
+
+`tiercheck.mjs` / `selftest.mjs` / `hostcheck.mjs` 需要连真实网关（读
+`~/.dsh/openai-gateway/api-key` 与 `127.0.0.1:8326`），所以它们不加隔离。
 
 结构：
 

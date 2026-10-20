@@ -512,13 +512,22 @@ function loadSpeedMemory() {
   try {
     const raw = fs.readFileSync(memoryFile(), 'utf8')
     const parsed = JSON.parse(raw)
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { profiles: {}, slow: {} }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return { profiles: {}, slow: {}, lastProbeAt: 0 }
     return {
       profiles: parsed.profiles !== null && typeof parsed.profiles === 'object' ? parsed.profiles : {},
       slow: parsed.slow !== null && typeof parsed.slow === 'object' ? parsed.slow : {},
+      /**
+       * 上一轮探测**完成**的时刻。
+       *
+       * 必须落盘：启动跳过窗口（`startupProbeSkipMinutes`）的判据是它，而它
+       * 早先只存在于进程内存里——冷启动时恒为 0，`sinceLast` 等于当前时间戳
+       * （约三千万分钟），**跳过窗口永远不命中**。于是「反复开关软件不会反复
+       * 全量探测」这条承诺完全不成立，每次启动都无条件打近百个请求。
+       */
+      lastProbeAt: Number.isFinite(Number(parsed.lastProbeAt)) ? Number(parsed.lastProbeAt) : 0,
     }
   } catch {
-    return { profiles: {}, slow: {} }
+    return { profiles: {}, slow: {}, lastProbeAt: 0 }
   }
 }
 
@@ -743,6 +752,31 @@ export function parseCustomModels(raw) {
   return [...new Set(ids)]
 }
 
+/**
+ * 把「勾选集合」编码成配置字段的值——**空集合必须写成哨兵**。
+ *
+ * ## 为什么需要这个函数
+ *
+ * 本插件里空串有一个特殊含义：**「用户还没动过这条链」→ 用自动分层的全部
+ * 候选**。它等价于「全选」。所以「我就要一条空链」不能用空串表示，必须用
+ * `__none__` 哨兵。
+ *
+ * 这个区别极易写错。实测踩过：用户在设置页取消链里**最后一个**勾选成员，
+ * 代码把空集合 `join(', ')` 成 `''` 写回，语义立刻反转成「没动过」→ 自动
+ * 分层把整档候选全部填回链里——「取消最后一个 = 恢复全部」。用户完全无法
+ * 把某条价格链清空，除非碰巧用「全不选」按钮走了另一个分支。
+ *
+ * 现在三处写回（`/chain/toggle`、`/chain/all`、`saveConfig`）都必须经过这里，
+ * 从结构上消除漂移的可能。
+ *
+ * @param {Iterable<string>} ids
+ * @returns {string} 逗号分隔的规范形式；空集合返回 `__none__`
+ */
+export function encodeMembers(ids) {
+  const list = parseCustomModels([...ids].join(', '))
+  return list.length === 0 ? NONE_SELECTED : list.join(', ')
+}
+
 
 
 /** 裸模型 id：去掉 provider 前缀与 `:free` / `:batch` 后缀。 */
@@ -893,12 +927,22 @@ export async function annotateExpiry(rows, deps) {
         if (end - now <= windowMs) { expiring += remaining; accountExpiring += remaining }
       }
       if (typeof account?.accountId === 'string' && account.accountId !== '') {
+        /**
+         * `known: false` 表示**这个账号的余额查不到**（渠道包回了
+         * `balance: null` + `error`，例如凭据失效）。
+         *
+         * 必须与「余额确实是 0」区分开：`planAccountOrder` 靠这个标记把它归到
+         * 「未知」（夹在中间），而不是当成「只有长期积分」压到最后——后者会让
+         * 一个可能还能用的账号永远排不上，而用户没有任何线索。
+         */
+        const known = account?.balance !== null && account?.balance !== undefined
         perAccount.push({
           accountId: account.accountId,
           nickname: typeof account.nickname === 'string' ? account.nickname : '',
           total: accountTotal,
           expiring: accountExpiring,
           nearestEnd,
+          known,
         })
       }
     }
@@ -984,11 +1028,25 @@ export function planAccountOrder(input) {
   const expiring = []
   const unknown = []
   const lasting = []
+  /** 没有 id 的账号：不能丢（否则 ordered 会比 accounts 短，reorder 必被拒）。 */
+  const idless = []
+  /** 停用账号：仍然排进 ordered，但**不参与轮换**。 */
+  const disabled = []
+  const enabledById = new Map()
   for (const account of accounts) {
     const id = String(account?.id ?? '')
-    if (id === '') continue
+    if (typeof account?.enabled === 'boolean') enabledById.set(id, account.enabled)
+    if (id === '') { idless.push(account); continue }
     const balance = byId.get(id)
-    if (options.expiryFirst === false || balance === undefined) { unknown.push(id); continue }
+    /**
+     * 余额**查询失败**（渠道包返回 `balance: null` + `error`）与「真的没有余额」
+     * 必须分开：前者是「不知道」，按 README 的承诺要夹在中间，不能被压到最后。
+     * 判据看显式标记而不是数值猜测——`known === false` 由 `annotateExpiry` 打上。
+     */
+    if (options.expiryFirst === false || balance === undefined || balance.known === false) {
+      unknown.push(id)
+      continue
+    }
     const end = Number(balance.nearestEnd)
     const hasEnding = Number.isFinite(end) && end > now && end - now <= windowMs
     if (hasEnding && Number(balance.expiring) > 0) expiring.push(id)
@@ -1008,29 +1066,73 @@ export function planAccountOrder(input) {
   expiring.sort((a, b) => endOf(a) - endOf(b))
 
   /**
-   * 除到期组之外的那些账号：合并成一个序列后整体旋转。
+   * 除到期组之外的那些账号：合并成一个序列后轮换。
    *
    * 为什么合并而不是两组各自旋转：渠道包只关心「谁是第一个」，分组内部各转
    * 各的会让「未知」那一组永远压在「长期」之前——而它们其实同样该被轮换到。
-   * 合成一个序列再转，起点落在谁身上谁就先上；到期的那些仍然固定在最前面。
+   *
+   * ## 轮换起点用「相对前移一位」，不用绝对游标
+   *
+   * ## 曾经踩的坑（必须留档）
+   *
+   * 渠道包的选号顺序就是**我们写回去的那个数组**。所以下一轮读回来的 `rest`
+   * 已经被上一轮旋转过了。此时再按「绝对游标 0,1,2,3…」去旋转它，起点会落在
+   * **三角数** `0,1,3,6,10,15…` 上，而不是 `0,1,2,3…`：
+   *
+   *   n=11 → 只有 6 个账号能当首位，另外 5 个**永远轮不到**（实测复现）；
+   *   n=9  → 4 个；n=10 → 6 个。
+   *
+   * 这与「不要集中用几个账号」正好相反，而且因为渠道包只取「第一个可用账号」，
+   * 被跳过的那几个就是彻底不用。
+   *
+   * 修法：**每次只相对前移一位**（起点恒为 1）。因为输入已经是上一轮的输出，
+   * 「相对前移一位」等价于绝对意义上的逐个推进，n 轮刚好遍历全部 n 个。
+   *
+   * ## 停用账号不占位置
+   *
+   * 停用账号仍留在 `ordered` 里（`account.reorder` 要求集合不变），但排在最后
+   * 且**不参与取模**——否则它会白白消耗一个轮换位，让实际用量在剩下的账号里
+   * 偏斜（3 个账号停 1 个时，一个账号的出现频率会是另一个的 2 倍）。
    */
   const rest = [...unknown, ...lasting]
+  const rotatable = rest.filter(id => enabledById.get(id) !== false)
+  const restDisabled = rest.filter(id => enabledById.get(id) === false)
+  disabled.push(...restDisabled)
   const rotationOn = options.rotation !== false
+  /**
+   * 用「稳定的基准序」而不是「上一轮写回的顺序」来做轮换。
+   *
+   * 这是比「相对前移」更稳的写法：把 rest 按 id 排序作为基准，游标在其中
+   * 逐个推进。这样即使写回失败、账号增删、或上一轮被手工改过顺序，轮换仍然
+   * 完整覆盖所有账号，不会跳位。
+   *
+   * 例外：用户有没有手工排过序？渠道包的 `account.reorder` 顺序可能来自用户
+   * 拖拽。用 id 基准会覆盖那个意图——但「分散用量」是用户明确要求的规则，
+   * 且到期优先那一层仍然保留用户可观察的语义，所以这里选规则优先。
+   */
+  const baseline = rotatable.slice().sort((a, b) => a.localeCompare(b))
   let start = 0
-  if (rest.length > 1 && rotationOn) {
-    start = (accountCursor.get(provider) ?? 0) % rest.length
-    accountCursor.set(provider, (start + 1) % rest.length)
-  } else if (rest.length > 0) {
+  if (baseline.length > 1 && rotationOn) {
+    start = (accountCursor.get(provider) ?? 0) % baseline.length
+    accountCursor.set(provider, (start + 1) % baseline.length)
+  } else if (baseline.length > 0) {
     accountCursor.set(provider, 0)
   }
-  const rotated = rest.length === 0 ? rest : [...rest.slice(start), ...rest.slice(0, start)]
+  const rotated = baseline.length === 0
+    ? baseline
+    : [...baseline.slice(start), ...baseline.slice(0, start)]
 
   return {
-    /** 该渠道的完整账号顺序（渠道包会按这个顺序选号）。 */
-    ordered: [...expiring, ...rotated],
+    /**
+     * 该渠道的完整账号顺序（渠道包会按这个顺序选号）。
+     *
+     * 分层：到期优先 → 可轮换（本轮起点在前的环形序）→ 停用账号 → 无 id 条目。
+     * 长度恒等于 `accounts.length`，满足 `account.reorder` 的「集合不可变」校验。
+     */
+    ordered: [...expiring, ...rotated, ...disabled, ...idless],
     /** 快到期、需要先用掉的账号（排在 `ordered` 最前面）。 */
     expiring,
-    /** 本轮轮换起点落在 `rest` 的第几位；0 表示没有轮换。 */
+    /** 本轮轮换起点落在基准序的第几位；0 表示没有轮换。 */
     cursor: start,
   }
 }
@@ -1151,8 +1253,24 @@ export function buildTiers(rows, config) {
    */
   const makeThroughputFirst = options => {
     const cache = new Map()
-    const slowTtfb = positive(options.slowTtfbMs, DEFAULTS.slowTtfbMs)
-    const minTps = positive(options.minTokensPerSecond, DEFAULTS.minTokensPerSecond)
+    /**
+     * ## 0 值必须表示「关闭」，不能被默认值顶回去
+     *
+     * `slowTtfbMs` 与 `minTokensPerSecond` 的公开语义都是「0 = 关闭判定」
+     * （设置页 `min: 0`、README、`DEFAULTS` 注释三处一致）。但早先这里用
+     * `positive(options.slowTtfbMs, DEFAULTS.slowTtfbMs)` 兜底——`positive(0, 10000)`
+     * 返回 10000，于是"关掉速度判定"之后分层**仍然按 50 tok/s 判慢**，用户把
+     * 模型设成 0 却毫无变化。
+     *
+     * 所以这里改成：有限且 >= 0 就原样用，只有真的缺失（NaN / undefined /
+     * 负数）才回落到默认值。`bandWidth` 早就这么写了，现在两处一致。
+     */
+    const numOr = (value, fallback) => {
+      const n = Number(value)
+      return Number.isFinite(n) && n >= 0 ? n : fallback
+    }
+    const slowTtfb = numOr(options.slowTtfbMs, DEFAULTS.slowTtfbMs)
+    const minTps = numOr(options.minTokensPerSecond, DEFAULTS.minTokensPerSecond)
     const expected = positive(options.expectedOutputTokens, DEFAULTS.expectedOutputTokens)
     const useTotal = options.preferThroughput !== false
     /**
@@ -1168,28 +1286,62 @@ export function buildTiers(rows, config) {
      * 分类结果：
      *
      *   `rank` 0 = 有吞吐数据（`band` 越小越快）；1 = 没有可比数据；2 = 实测慢。
+     *
+     * ## 每个桶都要有完整的比较键，否则比较器不是全序
+     *
+     * 早先 rank=1 桶里「有 ttfb 就比 ttfb、没有就跳过去比 rate」，于是
+     * A(有ttfb, rate .05)、B(无ttfb, rate .3)、C(有ttfb, rate .3) 能构成环
+     * （A<B、B<C、C<A）——同一批模型在两次 refresh 之间会整体换序，快速档取
+     * 前 N 个时「谁进窗口」变得不可复现（实测 6 种输入排列产出 3 种输出）。
+     *
+     * 现在给 rank=1 一个**统一的桶内键**：没有 ttfb 的恒排在有 ttfb 之后，
+     * 其余一律回落到 `byExpiryThenRate`（它自带 id 兜底）。
      */
     const classOf = row => {
       if (cache.has(row.id)) return cache.get(row.id)
       const value = options.preferMeasuredSpeed === false
-        ? { rank: 1 }
+        ? { rank: 1, ttfb: Number.POSITIVE_INFINITY }
         : (() => {
           const s = speedOf(row.id, { speedMemoryMinutes: options.speedMemoryMinutes })
-          if (s === undefined) return { rank: 1 }
+          /**
+           * 完全没有画像：rank 1，且 `ttfb` 必须是**数字**。
+           *
+           * 早先这里返回 `{ rank: 1 }`（`ttfb` 为 undefined），而另一条分支返回
+           * `{ rank: 1, ttfb: Infinity }`。比较器里 `undefined !== Infinity` 为真，
+           * 于是走 `Infinity < undefined ? -1 : 1`——**两个方向都返回 1**，
+           * 比较器自相矛盾，排序结果取决于输入顺序（实测同一集合 6 种排列
+           * 产出 4 种输出）。归一成同一个数字后才可能是全序。
+           */
+          if (s === undefined) return { rank: 1, ttfb: Number.POSITIVE_INFINITY }
           const tps = Number(s.tps)
           const hasTps = Number.isFinite(tps) && tps > 0
           /**
            * 「实测慢」的判据与请求期一致：首字太慢，或吞吐低于请求期门槛。
            * 注意**不能**把「没有 tps」当慢——只思考未作答的模型会因此被误杀。
+           * 两项都是 0 时表示用户关掉了判定，对应条件自然为假。
            */
           const slow = (slowTtfb > 0 && Number.isFinite(s.ttfb) && s.ttfb > slowTtfb)
             || (hasTps && minTps > 0 && tps < minTps)
           if (!hasTps) {
             /**
-             * 没有吞吐数据（或 tps=0）。首字快的那批仍值得排在后面之前：
+             * 没有可比吞吐（没测过 / tps=0）。首字快的那批仍值得排在后面之前：
              * 它们至少证明了「能很快开始作答」。
+             *
+             * ## 但 `ttfb` 必须取「真实观测」而不是惩罚值
+             *
+             * 探测失败时写的是 `ttfb = PROBE_TIMEOUT_MS`（12 秒）——那是**惩罚**
+             * 而不是观测。如果把它当成可比的 ttfb，一个「全部样本失败」的模型
+             * 会以 12000 参与 rank=1 桶的排序，与「真的没测过」的模型混在一起，
+             * 而这个 12000 又不是稳定值（换个超时上限就变），于是同一批模型在
+             * 不同配置下会排出不同顺序。
+             *
+             * 所以：有失败样本且没有成功样本时，`ttfb` 一律给 +∞（等价于
+             * 「没有可信首字」），只由 `byExpiryThenRate` 决定档内次序。
              */
-            return slow ? { rank: 2, ttfb: s.ttfb } : { rank: 1, ttfb: s.ttfb }
+            const hasObservableTtfb = Number.isFinite(s.ttfb) && s.ttfb > 0
+              && (Number(s.failures) || 0) === 0
+            const ttfbKey = hasObservableTtfb ? s.ttfb : Number.POSITIVE_INFINITY
+            return slow ? { rank: 2, ttfb: ttfbKey } : { rank: 1, ttfb: ttfbKey }
           }
           /**
            * 合计耗时只作为**同档内**的细分：吞吐已由 band 表达，这里用
@@ -1199,8 +1351,13 @@ export function buildTiers(rows, config) {
           return {
             rank: slow ? 2 : 0,
             /**
-             * 分档越高越慢，所以要**降序**比较。`bandWidth = 0` 时给 0，
-             * 于是「跨档」这一步恒不触发，退化成严格按 tps 排。
+             * 分档越高越慢，所以要**降序**比较。
+             *
+             * `bandWidth = 0`（用户关掉分档）时**所有模型同档**，此时主键必须
+             * 退回纯 tps：早先这里给 `band: 0` 让跨档判断恒不触发，于是比较
+             * 直接落到 `total`——而 `total` 含首字，一个 120 tok/s 但首字 4 秒
+             * 的模型会排在 100 tok/s 但首字 0 秒的后面，与「严格按吞吐降序」
+             * 的承诺相反（实测复现）。
              */
             band: bandWidth > 0 ? Math.floor(tps / bandWidth) : 0,
             tps,
@@ -1214,33 +1371,42 @@ export function buildTiers(rows, config) {
       const ca = classOf(a)
       const cb = classOf(b)
       if (ca.rank !== cb.rank) return ca.rank - cb.rank
-      /**
-       * 跨档：吞吐高的档（`band` 小）整档在前。
-       *
-       * **必须降序**：`Math.floor(tps / width)` 是「越大越快、档号越小」，
-       * 写成升序会把最慢的模型排到第一条——这是分档排序唯一容易写反的地方。
-       */
-      if (ca.rank === 0 && ca.band !== cb.band) return cb.band - ca.band
-      /**
-       * ## 为什么这里**不能**留容差
-       *
-       * 早期写的是 `if (Math.abs(diff) > 1) return diff`——想让毫秒级的抖动
-       * 不影响排序。但那会让比较器**不满足传递性**：A 比 B 快 0.5ms（判相等，
-       * 落到下一个键）、B 比 C 快 0.5ms（同样判相等），而 A 比 C 快 1.5ms
-       * （这次返回了差值）。于是「A<B、B<C，但 A>C」——排序结果取决于
-       * V8 内部取了哪几对，链的顺序会莫名其妙地乱掉。
-       *
-       * 正确做法：**所有键都严格比较，最后一定回落到 id**，保证比较器是一个
-       * 全序。抖动交给中位数与时间窗口去吸收，不靠比较器放水。
-       */
-      if (ca.rank === 0 && Number.isFinite(ca.total) && Number.isFinite(cb.total)) {
-        const diff = ca.total - cb.total
-        if (diff !== 0) return diff
-      }
-      // 没有吞吐数据：首字快的在前（同样只是同档内细分）。
-      if (ca.rank !== 2 && Number.isFinite(ca.ttfb) && Number.isFinite(cb.ttfb)) {
-        const diff = ca.ttfb - cb.ttfb
-        if (diff !== 0) return diff
+      if (ca.rank === 0) {
+        /**
+         * 跨档：吞吐高的档（`band` 小）整档在前。
+         *
+         * **必须降序**：`Math.floor(tps / width)` 是「越大越快、档号越小」，
+         * 写成升序会把最慢的模型排到第一条——这是分档排序唯一容易写反的地方。
+         */
+        if (ca.band !== cb.band) return cb.band - ca.band
+        /**
+         * 不分档时主键就是 tps 本身（严格降序）；分档时同档内再比合计耗时。
+         */
+        if (bandWidth === 0 && ca.tps !== cb.tps) return cb.tps - ca.tps
+        /**
+         * ## 为什么这里**不能**留容差
+         *
+         * 早期写的是 `if (Math.abs(diff) > 1) return diff`——想让毫秒级的抖动
+         * 不影响排序。但那会让比较器**不满足传递性**：A 比 B 快 0.5ms（判相等，
+         * 落到下一个键）、B 比 C 快 0.5ms（同样判相等），而 A 比 C 快 1.5ms
+         * （这次返回了差值）。于是「A<B、B<C，但 A>C」——排序结果取决于
+         * V8 内部取了哪几对，链的顺序会莫名其妙地乱掉。
+         *
+         * 正确做法：**所有键都严格比较，最后一定回落到 id**，保证比较器是一个
+         * 全序。抖动交给中位数与时间窗口去吸收，不靠比较器放水。
+         */
+        if (Number.isFinite(ca.total) && Number.isFinite(cb.total)) {
+          const diff = ca.total - cb.total
+          if (diff !== 0) return diff
+        }
+        // tps 相同（或都不进档）：按 tps 再兜一次，保证同档内也单调。
+        if (ca.tps !== cb.tps) return cb.tps - ca.tps
+      } else if (ca.rank !== 2) {
+        /**
+         * rank=1 桶：统一的 ttfb 键（无数据恒为 +∞）。这一步保证桶内可比，
+         * 不再出现「有时比 ttfb、有时比 rate」的环。
+         */
+        if (ca.ttfb !== cb.ttfb) return ca.ttfb < cb.ttfb ? -1 : 1
       }
       return byExpiryThenRate(a, b)
     }
@@ -1249,30 +1415,23 @@ export function buildTiers(rows, config) {
   /**
    * 是否该把这个模型**淘汰出所有链**。
    *
-   * 判据只有一条：**实测**证明它慢。
+   * 判据在 `isDropped`（唯一的真相），这里只加一层**按 id 缓存**：
+   * 一次分层要对四条链各判一遍，同一个模型会被问到 1–4 次，而每次都要读
+   * 速度画像、算中位数。缓存让这件事退化成一次 Map 查询。
    *
-   *   - 速度画像里的吞吐低于 `excludeBelowTps`；
-   *   - 或者它已经被请求期判成「慢模型」（`slowModels`，且仍在记忆窗口内）。
-   *
-   * 绝不因为「没有数据」淘汰：启动瞬间所有模型都还没测过，按「没数据就淘汰」
-   * 会得到一条空链。这也意味着第一次启动时淘汰不生效——测完一轮才生效，
-   * 而那正是用户要的「重测全部之后按结果挑」。
+   * **绝不能在这里另写一份判据**。之前就是这么漂的：这里判 `tps === 0`，
+   * 而 `speedOf` 当时永远不返回 0，于是「超时模型该不该淘汰」两个入口
+   * 各自都以为对方在处理，实际哪里都没处理。
    */
   const makeDropped = options => {
     const cut = Number(options.excludeBelowTps)
     const cache = new Map()
     return row => {
       if (!Number.isFinite(cut) || cut <= 0) return false
-      if (cache.has(row.id)) return cache.get(row.id)
-      const s = speedOf(row.id, { speedMemoryMinutes: options.speedMemoryMinutes })
-      const tps = Number(s?.tps)
-      let drop = false
-      if (Number.isFinite(tps) && tps > 0 && tps < cut) drop = true
-      else if (tps === 0 && isSlow(row.id, { slowMemoryMinutes: options.slowMemoryMinutes })) {
-        // tps = 0 且被标慢：只思考不回答、或请求期直接超时——两种都不该进链。
-        drop = true
-      }
-      cache.set(row.id, drop)
+      const id = row.id
+      if (cache.has(id)) return cache.get(id)
+      const drop = isDropped(id, cut, options)
+      cache.set(id, drop)
       return drop
     }
   }
@@ -1392,28 +1551,28 @@ export function buildTiers(rows, config) {
    */
   const quotaRank = row => (QUOTA_PROVIDERS.has(row.provider) ? 1 : 0)
   /**
-   * 免费链的排序器：吞吐为主键（与其它链完全一致），额度渠道作为**同档内**
-   * 的次要键——比倍率更靠后，因为免费层里「省额度」不如「不浪费会作废的」。
+   * 免费链的排序器：**先由 `bySpeed` 决定，只有它判并列时才用额度偏好细分**。
+   *
+   * ## 早先为什么是错的
+   *
+   * 原实现是「两个模型 tps 落在同一档就无条件返回 quotaRank 差值」，等于把
+   * 额度偏好提到 `bySpeed` 之上——两处实测误伤：
+   *
+   *   1. `bySpeed` 判定的「实测慢」（首字 11 秒、rank 2）被 quota 差值盖过，
+   *      于是一个首字 11 秒的 codearts 模型排在 500ms 的 buddy 模型前面；
+   *   2. `byExpiryThenRate` 的「到期优先」同样被盖过，有 500 点快到期积分的
+   *      模型被排到只有长期积分的模型之后——正好浪费了要作废的额度。
+   *
+   * 两个都是「注释承诺了 A、代码执行了 B」。现在把额度偏好降为**真正的
+   * 第三层**：吞吐档、到期、倍率都比完之后，还剩并列时才看渠道类型。
+   *
+   * 语义上这也更合理：额度渠道（按天给额度）与积分渠道只在「快慢、价格、
+   * 到期都一样」时才值得区分——那时省下会清零的每日额度确实更划算。
    */
   const bySpeedWithQuota = (a, b) => {
-    const rank = quotaRank(a) - quotaRank(b)
     const primary = bySpeed(a, b)
-    /**
-     * 只有两者落在**同一个吞吐档**时才让额度偏好插队。
-     *
-     * `bySpeed` 的内部状态拿不到，所以用 tps 的档号自己算一遍：同档 = 同
-     * 「快慢级别」，此时让额度偏好生效不会推翻吞吐语义。
-     */
-    const bandOf = r => {
-      const tps = throughputOf(r.id, config.speedMemoryMinutes)
-      const width = Number(config.throughputBandTps)
-      if (tps === undefined) return -1
-      return Number.isFinite(width) && width > 0 ? Math.floor(tps / width) : tps
-    }
-    const ba = bandOf(a)
-    const bb = bandOf(b)
-    if (ba === bb && rank !== 0) return rank
-    return primary
+    if (primary !== 0) return primary
+    return quotaRank(a) - quotaRank(b)
   }
   const freeOrdered = pickUsable(free).sort(bySpeedWithQuota)
 
@@ -1597,6 +1756,12 @@ export function candidatesFor(list, messages) {
  */
 const rotationCursor = new Map()
 
+/**
+ * @param {Array<object>} list - 已按优先级排好的候选
+ * @param {string} key - 游标键（链 id）
+ * @param {number} band - 轮换窗口大小。**`1` = 不轮换**（永远用第一个），
+ *   `0` / 负数 = 整条链轮换
+ */
 export function rotate(list, key, band = 0) {
   const rows = Array.isArray(list) ? list : []
   if (rows.length <= 1) return rows
@@ -1604,10 +1769,27 @@ export function rotate(list, key, band = 0) {
   /**
    * 轮换窗口大小。
    *
-   * `band <= 0` 或 `band >= length` 时退回「整条链轮换」——这是老行为，
-   * 保留它是为了让单测与「关了快速档」的场景语义不变。
+   * ## 这里的边界必须与文档一致
+   *
+   * `fastBandSize` 的语义是「只有吞吐最高的前 N 个参与轮流」：
+   *
+   *   - **N = 1 → 永远只用最快的那个**（不轮换）；
+   *   - N ≥ 2 → 前 N 个轮流当链首，N 后面的原样接在后面兜底；
+   *   - N = 0 或负数 → 整条链轮换（「关掉快速档」的老行为）。
+   *
+   * 早先写的是 `band > 1`，把 **1 排除在外**，于是 `fastBandSize=1` 反而落进
+   * 「整链轮换」——用户设成最激进的「只用一个最快的」，得到的却是最分散的
+   * 行为，每 N 次请求就轮到一个实测最慢的模型当链首。实测链首序列
+   * `a b c d e`（整链）而不是 `a a a a a`。
+   *
+   * 所以判据是 `band >= 1`，并且 `size === 1` 时**直接返回原顺序**（游标
+   * 不必前进，前进也没有第二个位置可去）。
    */
-  const size = Number.isFinite(band) && band > 1 ? Math.min(Math.trunc(band), rows.length) : rows.length
+  const width = Number(band)
+  const size = Number.isFinite(width) && width >= 1
+    ? Math.min(Math.trunc(width), rows.length)
+    : rows.length
+  if (size <= 1) return rows
   const start = (rotationCursor.get(id) ?? 0) % size
   rotationCursor.set(id, (start + 1) % size)
   if (size === rows.length) return [...rows.slice(start), ...rows.slice(0, start)]
@@ -1670,6 +1852,8 @@ function flushSpeedMemory() {
   persistSpeedMemory({
     profiles: Object.fromEntries(speedProfiles),
     slow: Object.fromEntries(slowModels),
+    /** 让「上一轮什么时候测完的」活过重启，见 `loadSpeedMemory`。 */
+    lastProbeAt: probeState.lastCompletedAt || 0,
   })
 }
 
@@ -1704,6 +1888,16 @@ const MEMORY_RESTORE_MAX_AGE_MS = 24 * 60 * 60 * 1000
 export function restoreSpeedMemory() {
   const data = loadSpeedMemory()
   const now = Date.now()
+  /**
+   * 恢复「上一轮探测完成时刻」。
+   *
+   * 不恢复它，启动跳过窗口（`startupProbeSkipMinutes`）就形同虚设——见
+   * `loadSpeedMemory` 里 `lastProbeAt` 的注释。
+   */
+  if (Number.isFinite(data.lastProbeAt) && data.lastProbeAt > 0) {
+    probeState.lastCompletedAt = data.lastProbeAt
+    probeState.finishedAt = data.lastProbeAt
+  }
   for (const [id, entry] of Object.entries(data.profiles)) {
     if (entry === null || typeof entry !== 'object') continue
     const at = Number(entry.at)
@@ -1787,7 +1981,30 @@ export function recordSpeed(modelId, sample) {
   scheduleMemoryFlush()
 }
 
-/** 某个模型的速度画像摘要（考虑过期）；没数据返回 undefined。 */
+/**
+ * 某个模型的速度画像摘要（考虑过期）；没数据返回 undefined。
+ *
+ * ## 吞吐中位数怎么算（这里是淘汰与排序的唯一数据源）
+ *
+ * 早先的实现先用 `v > 0` 把 `tps = 0` 的样本**过滤掉**再取中位数，带来三个
+ * 连锁错误（均有实测复现）：
+ *
+ *   1. **全部失败时 `tps` 变成 `undefined`**，于是 `makeDropped` /
+ *      `filterDropped` 里那个 `tps === 0` 分支成了死代码——探测超时、空响应、
+ *      只思考不作答的模型**永远淘汰不掉**，与用户「低于线的不进组合模型」的
+ *      要求正相反。
+ *   2. **失败被当成不存在**：7 次超时 + 1 次 150 tok/s，过滤后只剩一条 150，
+ *      中位数就是 150——一个 87.5% 请求失败的模型被当成优质快模型。
+ *   3. 偶数样本取上中位（`[40, 60]` → 60），系统性偏高约半档。
+ *
+ * 现在的规则：
+ *
+ *   - `tps` 用**全部**样本的中位数（失败样本按 0 参与），并单独回传
+ *     `failures` / `samples`，让上层能区分「稳定快」与「偶尔才成功」；
+ *   - 中位数取标准定义（偶数取中间两个的均值），不再系统性偏高；
+ *   - `ttfb` 仍然只统计有效样本（失败时记的是超时上限，那是惩罚值而不是观测值，
+ *     混进中位数会让真实首字被抬高）。
+ */
 export function speedOf(modelId, options = {}) {
   const entry = speedProfiles.get(String(modelId ?? ''))
   if (entry === undefined) return undefined
@@ -1797,16 +2014,36 @@ export function speedOf(modelId, options = {}) {
     scheduleMemoryFlush()
     return undefined
   }
-  // 取中位数：抗单次抖动。
-  const med = values => {
-    const nums = values.filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b)
+  /** 标准中位数：偶数取中间两个的均值，避免上偏。 */
+  const median = nums => {
     if (nums.length === 0) return undefined
-    return nums[Math.floor(nums.length / 2)]
+    const sorted = [...nums].sort((a, b) => a - b)
+    const mid = Math.floor(sorted.length / 2)
+    return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
   }
+  const tpsSamples = entry.samples.map(s => {
+    const value = Number(s?.tps)
+    return Number.isFinite(value) && value > 0 ? value : 0
+  })
+  const ttfbSamples = entry.samples
+    .map(s => Number(s?.ttfb))
+    .filter(value => Number.isFinite(value) && value > 0)
+  const failures = tpsSamples.filter(value => value === 0).length
+  const successes = tpsSamples.length - failures
+  /**
+   * 有成功样本才给 ttfb：全是失败时那个 12 秒是「超时上限」这个惩罚值，
+   * 不是真实首字观测。调用方靠 `failures === samples` 判断「这模型不行」。
+   */
   return {
-    ttfb: med(entry.samples.map(s => s.ttfb)),
-    tps: med(entry.samples.map(s => s.tps)),
+    ttfb: successes > 0 ? median(ttfbSamples) : undefined,
+    /**
+     * 有成功样本时取全部样本的中位数（失败按 0 计入，所以 7 次失败 + 1 次 150
+     * 得到 0，而不是 150）；一个成功样本都没有时明确返回 **0**（不是
+     * `undefined`）——`undefined` 的含义是「从没测过」，两者必须分开。
+     */
+    tps: successes > 0 ? median(tpsSamples) : 0,
     samples: entry.samples.length,
+    failures,
     at: entry.at,
   }
 }
@@ -1839,11 +2076,22 @@ export function isSlow(modelId, options = {}) {
 }
 
 /** 测试缝 / 设置页「清除记忆」。 */
-export function clearSlowModels() {
+/**
+ * 清空速度画像与慢模型记忆。
+ *
+ * @param {{persist?:boolean}} [options] - `persist: false` 时**只清内存、不写盘**。
+ *   测试脚本（`speedcheck.mjs` / `rankcheck.mjs`）需要它：那些脚本会调本函数
+ *   做用例隔离，而默认的落盘会把用户真实积累的画像整份抹掉——实测复现过
+ *   「按 README 跑一次 speedcheck，speed-memory.json 变成空文件」。
+ *
+ *   现在测试统一走 `testenv.mjs` 的 `isolate()`（临时 `DSH_HOME`），这个开关
+ *   是第二道保险：即使某个脚本忘了隔离，也不会伤到真实数据。
+ */
+export function clearSlowModels(options = {}) {
   slowModels.clear()
   speedProfiles.clear()
-  // 立刻落盘：用户点「清除记忆」就是要把它们永久清掉。
-  flushSpeedMemoryNow()
+  // 默认立刻落盘：用户点「清除记忆」就是要把它们永久清掉。
+  if (options.persist !== false) flushSpeedMemoryNow()
 }
 
 /** 只读快照，供设置页展示。 */
@@ -1896,14 +2144,48 @@ export function filterDropped(list, options = {}) {
   const rows = Array.isArray(list) ? list : []
   const cut = Number(options.excludeBelowTps)
   if (!Number.isFinite(cut) || cut <= 0) return rows
-  return rows.filter(row => {
-    const s = speedOf(row.id, { speedMemoryMinutes: options.speedMemoryMinutes })
-    const tps = Number(s?.tps)
-    if (Number.isFinite(tps) && tps > 0) return tps >= cut
-    // 没有吞吐数据：只有「被请求期判慢」的才淘汰，没测过的一律留下。
-    if (tps === 0) return !isSlow(row.id, { slowMemoryMinutes: options.slowMemoryMinutes })
-    return true
-  })
+  return rows.filter(row => !isDropped(row.id, cut, options))
+}
+
+/**
+ * 「这个模型是否被吞吐淘汰」的**唯一判据**。
+ *
+ * 分层期（`makeDropped`）与请求期（`filterDropped`）都调它，只是前者多包一层
+ * 缓存。两份实现各写一遍必然会漂移——实测就漂过：一处用 `tps === 0`、另一处
+ * 依赖 `speedOf` 返回 0，而 `speedOf` 当时永远不返回 0，于是「超时模型该不该
+ * 淘汰」在两处的答案都是「不淘汰」，却各自以为对方会处理。
+ *
+ * ## 规则
+ *
+ *   1. **没测过**（`speedOf === undefined`）→ 不淘汰。启动瞬间所有模型都没数据，
+ *      按「没数据就淘汰」会得到空链。
+ *   2. **有可比吞吐**（`tps > 0`）→ 低于线就淘汰。
+ *   3. **有画像但没有可比吞吐**（`tps = 0`：全部样本失败，或样本都太短）→
+ *      看它是否**确实被证明不行**：
+ *        - 有失败样本且占比达到一半以上 → 淘汰（这就是「超时/空响应/只思考」
+ *          那类模型，用户明确要求不进组合）；
+ *        - 否则（样本都太短、没有失败）→ 不淘汰，只当作「还没测出可比吞吐」。
+ *   4. 另外，被**请求期**判慢（`slowModels`）且仍在窗口内的，也淘汰——那是
+ *      真实请求里的证据。
+ *
+ * @param {string} id
+ * @param {number} cut - 淘汰线（tokens/s），调用方保证 > 0
+ * @param {{speedMemoryMinutes?:number, slowMemoryMinutes?:number}} options
+ * @returns {boolean}
+ */
+export function isDropped(id, cut, options = {}) {
+  const s = speedOf(id, { speedMemoryMinutes: options.speedMemoryMinutes })
+  if (s === undefined) return false
+  const tps = Number(s.tps)
+  if (Number.isFinite(tps) && tps > 0) return tps < cut
+  /**
+   * `tps = 0`：没有可比吞吐。区分「测出来就是不行」与「样本太短」。
+   */
+  const failures = Number(s.failures) || 0
+  const samples = Number(s.samples) || 0
+  if (failures > 0 && samples > 0 && failures * 2 >= samples) return true
+  // 剩余情况：看请求期是否判过它慢。
+  return isSlow(id, { slowMemoryMinutes: options.slowMemoryMinutes })
 }
 
 /**
@@ -1958,11 +2240,63 @@ const MIN_SPEED_SAMPLE_CHARS = 24
  * @param {number} elapsedMs - 从首个正文增量到现在的毫秒数
  * @returns {number} tokens/s；输入无效时返回 0（不下结论）
  */
-export function estimateTps(chars, elapsedMs) {
-  if (!Number.isFinite(chars) || chars <= 0) return 0
+/**
+ * 估算 token 数：**中文按 1 字 1 token，其它按 3 字符 1 token**。
+ *
+ * ## 为什么不能一刀切 `chars / 3`
+ *
+ * 早先 `estimateTps` 固定用 `chars / 3`，对中文（1 字 ≈ 1 token）**系统性低估
+ * 约 3 倍**。实测：
+ *
+ *   - 123 个中文字 / 925ms → 算出 **44 tok/s**（真实约 133）
+ *   - 90 字 / 3000ms → 算出 **10 tok/s**（真实约 30）
+ *
+ * 而 `minTokensPerSecond` 与 `excludeBelowTps` 默认都是 50——于是**一段完全
+ * 正常的中文回答会被判成「慢模型」**：这一轮被中止换人，模型被 `markSlow`，
+ * 还会被淘汰线踢出候选链。中文用户的主场景直接命中，越用可选模型越少。
+ *
+ * 这不只是精度问题，是把正常行为判成故障。
+ *
+ * @param {string|number} textOrChars - 正文，或（兼容旧调用）字符数
+ * @param {number} elapsedMs
+ * @returns {number} tokens/s；输入无效时返回 0（不下结论）
+ */
+export function estimateTps(textOrChars, elapsedMs) {
   if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 0
-  const tokens = chars / 3
+  const tokens = typeof textOrChars === 'string'
+    ? countTokens(textOrChars)
+    : Number.isFinite(textOrChars) && textOrChars > 0 ? textOrChars / 3 : 0
+  if (tokens <= 0) return 0
   return tokens / (elapsedMs / 1000)
+}
+
+/**
+ * 粗估一段文本的 token 数。
+ *
+ * 中文、日文假名、韩文按 **1 字符 ≈ 1 token**（这是主流分词器对 CJK 的经验
+ * 值）；其余（拉丁、数字、标点、空白）按 **3 字符 ≈ 1 token**。
+ *
+ * 为什么不用真正的分词器：本插件只需要「快慢量级」，而引入一个分词器会带来
+ * 词典体积与版本漂移；误差 ±20% 对「50 tok/s 合不合格」这种判断完全够用，
+ * 3 倍的偏差才是真问题。
+ */
+export function countTokens(text) {
+  const source = String(text ?? '')
+  if (source === '') return 0
+  let cjk = 0
+  for (const ch of source) {
+    const code = ch.codePointAt(0) ?? 0
+    if (
+      (code >= 0x3040 && code <= 0x30ff) // 日文假名
+      || (code >= 0x3400 && code <= 0x4dbf) // CJK 扩展 A
+      || (code >= 0x4e00 && code <= 0x9fff) // CJK 基本区
+      || (code >= 0xf900 && code <= 0xfaff) // CJK 兼容
+      || (code >= 0xac00 && code <= 0xd7af) // 韩文
+      || (code >= 0xff00 && code <= 0xffef) // 全角标点
+    ) cjk += 1
+  }
+  const rest = [...source].length - cjk
+  return cjk + rest / 3
 }
 
 
@@ -2051,12 +2385,23 @@ const probeState = {
   total: 0,
   done: 0,
   startedAt: 0,
+  /**
+   * 上一轮**完成**的时刻（也是这一轮的开始哨兵：开跑时清 0）。
+   *
+   * ⚠️ 用户点「停止」被取消的那一轮**不能**写这个值：它并没有测完，
+   * 却会让 60 秒冷却与启动跳过窗口都以它为据（实测：停止后 60ms 再点测速
+   * 被拒「距上一轮不足 60 秒」；一次 0 样本的取消轮还会让下一次启动的
+   * 重测在 10 分钟窗口内被跳过）。
+   */
   finishedAt: 0,
+  /** 最近一次「真正测完」的时刻；会被落盘，供启动跳过窗口使用。 */
+  lastCompletedAt: 0,
   /** 待测队列；点「停止」时清空即可中断。 */
   queue: [],
   /** 用户点了停止。 */
   cancelled: false,
 }
+
 
 /** 只读快照，供设置页显示进度。 */
 export function probeSnapshot() {
@@ -2102,6 +2447,8 @@ export async function probeModel(modelId, deps) {
   /** 第一个**任意可见**增量（正文或思考）的时刻——这才是用户实际等的。 */
   let firstVisibleAt = 0
   let chars = 0
+  /** 累积的正文本体，供 `countTokens` 按语言折算 token。 */
+  let text = ''
   let reasoningChars = 0
   let sawFinish = false
   try {
@@ -2146,6 +2493,11 @@ export async function probeModel(modelId, deps) {
       if (chunk.type === 'text-delta') {
         if (firstVisibleAt === 0) firstVisibleAt = Date.now()
         if (firstTextAt === 0) firstTextAt = Date.now()
+        /**
+         * 累积**实际文本**而不是字符数：`estimateTps` 要按语言折算 token，
+         * 而「123 个字」在中文与英文里是完全不同的 token 量。
+         */
+        text += String(chunk.text ?? '')
         chars += String(chunk.text ?? '').length
       }
       if (chunk.type === 'reasoning-delta') {
@@ -2179,10 +2531,29 @@ export async function probeModel(modelId, deps) {
       return { ok: false, error: sawFinish ? '空响应（未产出任何内容）' : '流提前结束' }
     }
     const genMs = Math.max(1, Date.now() - firstTextAt)
+    /**
+     * ## 字符太少就不给吞吐，别把「秒回」测成「慢」
+     *
+     * 探测 prompt 是 `hi`，模型常常只回 3–33 个字符。`estimateTps` 是
+     * 「字符/3 ÷ 秒」，分母只有几百毫秒时任何抖动都放大成数量级差异——实测：
+     *
+     *   - 3 字符 / 200ms → **4.9 tok/s**
+     *   - 33 字符 / 465ms → **18.7 tok/s**
+     *
+     * 默认 `excludeBelowTps = 50`，于是**一个 200ms 就答完的模型会被判成
+     * 实测慢并被踢出全部四条链**，而且每轮探测都追加一条同样偏低的样本，
+     * 越测越沉。这比不测更糟。
+     *
+     * 与请求期判定用同一个门槛（`MIN_SPEED_SAMPLE_CHARS`）：字符不够时回
+     * `tps: 0`——含义是「这次没测出可比吞吐」，由 `speedOf` 把它当作一次
+     * **失败样本**（计入 failures），而不是当作「它很慢」。
+     */
+    const tps = chars >= MIN_SPEED_SAMPLE_CHARS ? estimateTps(text, genMs) : 0
     return {
       ok: true,
       ttfb: firstTextAt - startedAt,
-      tps: estimateTps(chars, genMs),
+      tps,
+      ...chars < MIN_SPEED_SAMPLE_CHARS ? { note: `样本太短（${chars} 字），不计吞吐` } : {},
     }
   } catch (error) {
     const aborted = controller.signal.aborted
@@ -2295,6 +2666,9 @@ export async function runProbe(deps) {
          *
          * 门槛从 `deps` 里取：`runProbe` 是模块级函数，**看不到** `apply` 里的
          * `config` 闭包。任何 `config.xxx` 出现在这里都是 ReferenceError。
+         *
+         * `tps === 0`（样本太短，见 `probeModel`）既不能算「快」也不能算
+         * 「慢」——它是「这次没测出可比吞吐」，所以既不清慢记录、也不记慢。
          */
         const floor = positive(deps.minTokensPerSecond, DEFAULTS.minTokensPerSecond)
         if (Number(result.tps) > 0 && Number(result.tps) >= floor) {
@@ -2302,25 +2676,25 @@ export async function runProbe(deps) {
         }
       } else {
         /**
-         * 失败也记一笔「很慢」。
+         * ## 失败要分两类，不能一律记成「很慢」
          *
-         * 一个连最小请求都超时的模型，实际用起来只会更糟。给它一个等于超时
-         * 上限的 ttfb，让速度排序把它沉到最后——这比「没数据」更能保护用户
-         * 不再浪费一次完整请求的时间。
-         */
-        recordSpeed(row.id, { ttfb: PROBE_TIMEOUT_MS, tps: 0 })
-        /**
-         * **速度类**失败才记「慢」，HTTP 4xx 不算。
+         * `isSpeedFailure` 认的是「超时 / 空响应 / 流提前结束」——这些确实说明
+         * 这个模型干活不行，写一条 `tps:0` 的样本（并记慢）是合理的。
          *
-         * 这个区别决定了它会不会被「吞吐淘汰」摘掉：超时 / 空响应 / 只思考
-         * 不回答是「这个模型干活不行」，该淘汰；而 `HTTP 400` 多半是请求形状
-         * 或该模型不支持这套参数——那不是慢，换个参数就能用，把它淘汰掉是
-         * 误伤。
+         * 但 `HTTP 4xx/5xx`、`fetch failed`、`ECONNREFUSED` 是**请求或服务**的
+         * 问题：换参数就能用、网关抖动也会自己恢复。早先对它们也写
+         * `recordSpeed({ttfb: 12000, tps: 0})`，等于凭空造一条「首字 12 秒」的
+         * 假观测——实测会让一个真实 80 tok/s 的模型排到 75 tok/s 的后面，并把它
+         * 真实的慢记录顺手清掉（`markFast`）。
+         *
+         * 所以：**只有速度类失败才写样本、才记慢；其余失败什么都不改**。
+         * 保留既有画像与慢记录，只记日志——「这次没测出来」不等于「它变慢/变快」。
          */
         if (isSpeedFailure(result.error)) {
+          recordSpeed(row.id, { ttfb: PROBE_TIMEOUT_MS, tps: 0 })
           markSlow(row.id)
         } else {
-          markFast(row.id)
+          log(`探测跳过（非速度类失败，不改画像）：${row.id} — ${String(result.error ?? '').slice(0, 60)}`)
         }
       }
       probeState.done += 1
@@ -2343,14 +2717,35 @@ export async function runProbe(deps) {
     }
   } finally {
     probeState.running = false
+    /**
+     * ## 被取消的一轮不能算「测完」
+     *
+     * `finishedAt` 同时被 60 秒冷却与启动跳过窗口当作「上一轮完成时间」。
+     * 早先无论是否取消都写 `Date.now()`，于是：
+     *
+     *   - 用户点「停止」后 60 秒内再点「测速」会被拒（而那一轮根本没测完）；
+     *   - 一次 `done: 0` 的取消轮，会让下一次启动的重测在 10 分钟窗口内被跳过
+     *     ——用「什么都没测」当「刚测过」的证据。
+     *
+     * 所以：取消时把 `finishedAt` 归零（表示「没有可参考的完成时刻」），
+     * 只有真正跑完才同时推进 `finishedAt` 与落盘用的 `lastCompletedAt`。
+     */
+    if (probeState.cancelled) {
+      probeState.finishedAt = 0
+      probeState.queue = []
+      flushSpeedMemoryNow()
+      return { started: true, total: pending.length, cancelled: true }
+    }
     probeState.finishedAt = Date.now()
+    probeState.lastCompletedAt = probeState.finishedAt
     probeState.queue = []
     /**
      * 显式落盘。
      *
      * 防抖定时器只会「1.5 秒内没新样本时写一次」，但探测刚跑完这段时间正是
      * 用户期待数据已保存的时刻——如果进程恰好在此刻退出，最后一批样本就丢了。
-     * 这里直接落盘，把确定性给到调用方。
+     * 这里直接落盘，把确定性给到调用方。`lastCompletedAt` 也在这里被写进
+     * 落盘文件，让启动跳过窗口在重启后仍然有效。
      */
     flushSpeedMemoryNow()
   }
@@ -2461,12 +2856,62 @@ export function flattenText(content) {
 }
 
 /**
+ * 把一个 harness 图片块解析成可发送的 data URL / 远程 URL。
+ *
+ * ## 为什么不能只看 `attachment.url`
+ *
+ * DSH 的附件引用字段是 **`attachmentId`**（+ `mediaType`），不是 `url`：
+ * 本机 dsh-attachment-local 返回 `{ attachmentId: AttachmentId(...) }`，渠道包
+ * 的所有 `collectImages` 也以 `typeof block.attachment?.attachmentId === 'string'`
+ * 为判据。
+ *
+ * 早先这里只认 `attachment.url`，于是**每一张图都被静默丢弃**；只发一张图
+ * （没有文字）时 `messages` 直接变成空数组，整条链 400 全灭（用户目录里的
+ * `last-request.json` 就是这条路径的实证：`messages must be a non-empty array`）。
+ *
+ * ## 解析顺序
+ *
+ *   1. `resolver`（内核的附件服务）——最可靠，能拿到真字节；
+ *   2. `attachment.url`——有些调用方直接给现成 URL；
+ *   3. `attachment.data` / `base64`——少数路径会直接带内容；
+ *   4. 都没有 → 返回 `undefined`，由调用方写一个 `[image]` 占位而不是**假装
+ *      什么都没发生**（至少要能让模型知道「这里原本有张图」）。
+ *
+ * @param {object} attachment
+ * @param {(attachment:object)=>string|undefined} [resolver]
+ * @returns {string|undefined}
+ */
+export function resolveImageUrl(attachment, resolver) {
+  if (attachment === null || typeof attachment !== 'object') return undefined
+  if (attachment.offloaded === true) return undefined
+  try {
+    const viaResolver = resolver?.(attachment)
+    if (typeof viaResolver === 'string' && viaResolver !== '') return viaResolver
+  } catch { /* 解析失败退回其它来源 */ }
+  if (typeof attachment.url === 'string' && attachment.url !== '') return attachment.url
+  const base64 = typeof attachment.base64 === 'string' ? attachment.base64
+    : (typeof attachment.data === 'string' ? attachment.data : '')
+  if (base64 !== '') {
+    const mime = typeof attachment.mediaType === 'string' && attachment.mediaType !== ''
+      ? attachment.mediaType
+      : 'image/png'
+    return `data:${mime};base64,${base64}`
+  }
+  return undefined
+}
+
+/**
  * harness 消息 → 网关 Chat 消息。
  *
- * 图片按 harness 的 block 形状取 `attachment.url`；`tool` 角色消息保留
- * `tool_call_id`，否则网关无法把结果配回调用。
+ * 图片经 `resolveImageUrl` 解析（支持 `attachmentId` 与 `url` 两种形状）；
+ * `tool` 角色消息保留 `tool_call_id`，否则网关无法把结果配回调用。
+ *
+ * @param {object} options - harness 的 stream options
+ * @param {{resolveImage?:(attachment:object)=>string|undefined}} [deps]
+ *   可选：内核附件解析器（`ctx.get('attachments')` 之类）。拿不到时退化为
+ *   只认块里自带的 url / base64。
  */
-export function toChatBody(options) {
+export function toChatBody(options, deps = {}) {
   const source = Array.isArray(options.messages) ? options.messages : []
 
   /**
@@ -2521,12 +2966,46 @@ export function toChatBody(options) {
   }
 
   const messages = []
-  const system = typeof options.system === 'string' ? options.system.trim() : ''
-  if (system !== '') messages.push({ role: 'system', content: system })
+  /**
+   * ## system 消息必须合并，绝不能丢
+   *
+   * 早先这里是 `if (role === 'system') continue`——把所有 system 历史和
+   * `options.system` 一起丢掉。但 DSH 的系统提示**恰恰是以 system 消息形式
+   * 存在于 `options.messages` 里**（agent-loop 的 buildRequest 只传
+   * `messages`/`tools`/`sessionId`/`signal`，从不传 `options.system`；
+   * system/message 事件经 session.deriveMessages 进入 messages；上游
+   * `messages.js` 也是把 system 与 developer 统一映射成 `role: 'system'`）。
+   *
+   * 丢掉它们的后果是模型收到一份「没有系统提示、没有工具说明、没有 developer
+   * 指令」的裸对话：人格/安全约束/工具使用约定全部失效，而界面上看不出任何
+   * 异常。这是功能层面的静默失效。
+   *
+   * ## 为什么按顺序合并成一条
+   *
+   * DSH 在 in-history 模式下会**追加多段** system 更新（不是替换）。逐段保留
+   * 成多条 system 也行，但 OpenAI 兼容网关对「多条 system」的支持参差；合并
+   * 成一条既保语义又最稳。`options.system`（若内核给了）排在最前。
+   */
+  const systemParts = []
+  const topSystem = typeof options.system === 'string' ? options.system.trim() : ''
+  if (topSystem !== '') systemParts.push(topSystem)
+  for (const message of source) {
+    if (message?.role !== 'system' && message?.role !== 'developer') continue
+    /**
+     * 用 `flattenText` 而不是只取 text 块：developer 消息可能带
+     * tool-addition / tool-removal 之类的结构块，摊平成文本至少不丢内容
+     * （丢掉它们的代价比多几行文本大得多）。
+     */
+    const value = flattenText(message?.content).trim()
+      || (typeof message?.content === 'string' ? message.content.trim() : '')
+    if (value !== '') systemParts.push(value)
+  }
+  if (systemParts.length > 0) messages.push({ role: 'system', content: systemParts.join('\n\n') })
 
   for (const message of source) {
     const role = message?.role
-    if (role === 'system') continue
+    // system / developer 已经在上面合并过，这里跳过（不是丢弃）。
+    if (role === 'system' || role === 'developer') continue
 
     // 独立的 tool 消息：只有 id 属于「保留的调用」才发，否则丢弃。
     if (role === 'tool') {
@@ -2552,8 +3031,16 @@ export function toChatBody(options) {
         const value = String(block.text ?? '')
         if (value !== '') parts.push({ type: 'text', text: value })
       } else if (block?.type === 'image') {
-        const url = typeof block.attachment?.url === 'string' ? block.attachment.url : ''
-        if (url !== '') parts.push({ type: 'image_url', image_url: { url } })
+        /**
+         * 图片：解析成 image_url；解析不出就放文本占位。
+         *
+         * 占位不是「凑数」——它让模型知道「这里原本有张图，只是拿不到」，
+         * 比静默丢弃让模型凭空回答要好。而且它保证了 `parts` 非空，从而
+         * 不会让这条消息整个消失（纯图片消息消失会导致 `messages: []` → 400）。
+         */
+        const url = resolveImageUrl(block.attachment, deps.resolveImage)
+        if (url !== undefined) parts.push({ type: 'image_url', image_url: { url } })
+        else parts.push({ type: 'text', text: '[image unavailable]' })
       } else if (block?.type === 'tool-result') {
         const id = String(block.toolCallId ?? '').trim()
         if (keepCallIds.has(id)) inlineResults.push({ id, content: flattenText(block.content) || '(no output)' })
@@ -2592,6 +3079,24 @@ export function toChatBody(options) {
       messages.push({ role: 'tool', tool_call_id: result.id, content: result.content })
     }
   }
+
+  /**
+   * ## 空 messages 必须兜底
+   *
+   * 上游对空 `messages` 是**明确拒绝**的（`messages must be a non-empty array`
+   * → 400）。而有多种常见历史形状会把它清空：
+   *
+   *   - 全部 tool-call 都配不上对（会话被裁剪、或换过 provider 后 id 失配）；
+   *   - 用户消息的 content 是空数组；
+   *   - 历史只剩 system（旧版本还会把它丢掉）。
+   *
+   * 这些情况下把空数组发出去，结果是**整条链三个候选各 400、全部失败**，而
+   * 用户看到的错误是「所有候选失败」——归因完全指错方向（他会去查网关、查账号，
+   * 而真正的问题在本地序列化）。
+   *
+   * 兜底一个有内容的 user 消息，让请求至少是一个合法请求。
+   */
+  if (messages.length === 0) messages.push({ role: 'user', content: '(no content)' })
 
   const body = { messages, stream: true }
   if (Array.isArray(options.tools) && options.tools.length > 0) {
@@ -2697,8 +3202,45 @@ export function apply(ctx, rawConfig) {
     creditsPending: false,
   }
   let timer
+  /**
+   * 正在进行中的 `refresh()`。
+   *
+   * ## 为什么必须单飞
+   *
+   * `refresh` 有 7 个并发入口：启动重试、定时器、`/refresh`、`/chain/toggle`、
+   * `/chain/all`、`saveConfig`、端口就绪后的补刷。每一次都会在 `fetchRows`
+   * 返回后**无条件**覆写 `tiers` / `allRows` / `status`，而 `expiryGeneration`
+   * 只保护 credits 分支、保护不到分层结果本身。
+   *
+   * 于是最终状态由「谁最后完成」决定，实测两种坏结果：
+   *
+   *   - **慢的旧清单覆盖快的新清单**：老请求延迟 1.2 秒返回，把已经刷新的
+   *     候选池又改回旧数据；
+   *   - **故障被假成功掩盖**：后发起的刷新遇到 503 写了 `ok:false`，先发起的
+   *     慢刷新随后成功落地，把 `error` 清空、`ok` 抹成 true——页面显示一切正常，
+   *     而网关其实是坏的。
+   *
+   * 单飞之后同一时刻只有一轮在跑，其余调用直接复用它的结果（语义上也正确：
+   * 「再刷新一次」发生在已有刷新进行中时，等它就行）。
+   */
+  let refreshInflight = null
 
   const log = message => { if (config.verbose) logger.info?.(`[baipiao] ${message}`) }
+
+  /**
+   * 按新配置重建刷新定时器。
+   *
+   * `refreshMinutes` 是可以在设置页随时改的，而早先定时器只在 `apply` 时按
+   * 当时的分钟数创建一次：改成 5 分钟仍按 30 分钟跑，改成 0（文档说「只在启动
+   * 时拉一次」）也停不掉已经建好的 30 分钟定时器。README 还承诺「改完立即生效」。
+   */
+  function startRefreshTimer(minutes) {
+    if (timer !== undefined) { clearInterval(timer); timer = undefined }
+    const value = Number(minutes)
+    if (!Number.isFinite(value) || value <= 0) return
+    timer = setInterval(() => { void refresh().catch(() => {}) }, value * 60_000)
+    timer.unref?.()
+  }
 
   /**
    * 把 Custom 里已经查不到的模型 id（改名/下架）从配置里写掉。
@@ -2955,7 +3497,19 @@ export function apply(ctx, rawConfig) {
     return next
   }
 
+  /**
+   * 重新拉取并分层（**单飞**）。
+   *
+   * 已有刷新在进行时直接复用那一轮的结果，不再开第二个——见 `refreshInflight`
+   * 的注释（并发刷新会让旧清单覆盖新清单、让故障被假成功掩盖）。
+   */
   async function refresh() {
+    if (refreshInflight !== null) return refreshInflight
+    refreshInflight = refreshOnce().finally(() => { refreshInflight = null })
+    return refreshInflight
+  }
+
+  async function refreshOnce() {
     const fetched = await fetchRows(config)
     if (!fetched.ok) {
       status = { ...status, at: Date.now(), ok: false, error: fetched.error }
@@ -3011,9 +3565,24 @@ export function apply(ctx, rawConfig) {
     log(`已分层：免费 ${tiers.free.length} · 低积分 ${tiers.low.length} · 高积分 ${tiers.high.length}（共 ${fetched.rows.length} 个）`)
     try { ctx.emit('llm/adapters-updated') } catch { /* 老内核没有这个事件 */ }
 
-    // 只有「要按到期排序」且「允许查询余额」时才去找渠道包；任一为假就完全
-    // 不碰其它插件的接口，本插件只靠网关清单工作。
-    if (config.preferExpiringCredits !== false && config.expiryLookup !== false) {
+    /**
+     * 什么时候去查余额？
+     *
+     * 早先的条件只有「模型层要按到期排序」——`preferExpiringCredits`。那带来
+     * 一个隐蔽的连带失效：**账号层的「到期优先 + 轮流」也被它关死了**。
+     *
+     * 因为 `reorderAccounts` 的唯一调用点在这个分支内部，而它需要逐账号余额
+     * 才能判断「谁的积分先作废」。用户只是不想让**模型**按快到期排序（关掉
+     * `preferExpiringCredits`），结果账号顺序再也不会更新——而
+     * `accountExpiryFirst` / `accountRotation` 两个开关还显示着「开」，页面
+     * 的 accountPlan 停在旧值，没有任何提示。
+     *
+     * 现在条件是三者之一：模型层要到期优先，**或**账号层要到期优先，**或**
+     * 账号层要轮换。只要有一件事需要余额，就去查。
+     */
+    const wantsModelExpiry = config.preferExpiringCredits !== false
+    const wantsAccountOrder = config.accountExpiryFirst !== false || config.accountRotation !== false
+    if ((wantsModelExpiry || wantsAccountOrder) && config.expiryLookup !== false) {
       status = { ...status, creditsPending: true }
       /**
        * 本轮余额查询的代号。
@@ -3102,6 +3671,15 @@ export function apply(ctx, rawConfig) {
       expiryGeneration += 1
       status = { ...status, creditsPending: false }
       log('未开启余额查询，清掉「积分更新中」标记，并作废在途的余额应答')
+    }
+
+    /**
+     * 分层成功了，但启动重测可能还没跑（上一次试的时候 Key 还没就绪、或
+     * 候选池还是空的）。这里补一次：`startStartupProbe` 内部有 `startupProbeDone`
+     * 幂等，跑过了就是空操作。
+     */
+    if (!startupProbeDone) {
+      try { startStartupProbe() } catch { /* 探测失败不影响分层 */ }
     }
 
     return { ok: true, tiers: viewTiers() }
@@ -3289,7 +3867,19 @@ export function apply(ctx, rawConfig) {
   function viewConfig() {
     return {
       gatewayUrl: config.gatewayUrl,
-      gatewayKey: config.gatewayKey === '' ? '' : '••••••',
+      /**
+       * ## 不回传掩码
+       *
+       * 早先这里回 `'••••••'`，前端把它当成受控 input 的 value。用户点进去
+       * 补一个字符（最自然的「改 Key」动作），提交的就是 `'••••••sk-new'`，
+       * 宿主原样落盘 → 之后所有网关调用 401。更糟的是再读仍显示掩码、
+       * `gatewayKeyConfigured` 仍是 true，**界面完全看不出凭证已经损坏**。
+       *
+       * 现在恒回空串，用 `gatewayKeyConfigured` 表示「已配置」，前端用
+       * placeholder 显示「已配置（留空表示不修改）」。`saveConfig` 里还有
+       * 第二道闸：收到掩码或以掩码开头的值一律视为「未修改」。
+       */
+      gatewayKey: '',
       gatewayKeyConfigured: resolveGatewayKey(config.gatewayKey).key !== '',
       refreshMinutes: config.refreshMinutes,
       lowMaxRate: config.lowMaxRate,
@@ -3388,18 +3978,37 @@ export function apply(ctx, rawConfig) {
   function startStartupProbe() {
     if (config.probeOnStartup === false) return
     if (startupProbeDone) return
-    startupProbeDone = true
+    /**
+     * ## 标志只在**真正开跑**之后置位
+     *
+     * 早先 `startupProbeDone = true` 写在所有跳过判定之前，而 `bootRefresh`
+     * 只在首次分层成功后挂**一次** 5 秒定时器、没有任何重试路径。于是下面
+     * 任何一个跳过理由都会让本次进程内**永不重测**：
+     *
+     *   - 定时器触发时网关 Key 还没就绪（渠道包刚启动）；
+     *   - `allRows` 还是空（首次 refresh 成功但清单 0 行）；
+     *   - 上一轮刚测完仍在跳过窗口内，但窗口随后就过期了。
+     *
+     * 用户看到的是「启动时自动重测全部」明明开着、画像却一直是旧的。
+     */
     const skipMs = Math.max(0, Number(config.startupProbeSkipMinutes) || 0) * 60_000
-    const sinceLast = Date.now() - (probeState.finishedAt || 0)
-    if (skipMs > 0 && probeState.finishedAt > 0 && sinceLast < skipMs) {
+    /**
+     * 判据用 `lastCompletedAt`（会落盘）而不是 `finishedAt`（纯内存）。
+     * `finishedAt` 在冷启动时是 0，`sinceLast` 会等于当前时间戳——窗口永远
+     * 不命中，等于每次启动都全量探测。
+     */
+    const lastCompleted = probeState.lastCompletedAt || probeState.finishedAt || 0
+    const sinceLast = Date.now() - lastCompleted
+    if (skipMs > 0 && lastCompleted > 0 && sinceLast < skipMs) {
       log(`启动重测跳过：上一轮测速在 ${Math.round(sinceLast / 60_000)} 分钟前完成（窗口 ${Math.round(skipMs / 60_000)} 分钟）`)
       return
     }
     const { key } = resolveGatewayKey(config.gatewayKey)
-    if (key === '') { log('启动重测跳过：没有网关 Key'); return }
+    if (key === '') { log('启动重测跳过：网关 Key 尚未就绪（会在下次分层后重试）'); return }
     const list = probeTargets()
-    if (list.length === 0) { log('启动重测跳过：候选池为空'); return }
+    if (list.length === 0) { log('启动重测跳过：候选池为空（会在下次分层后重试）'); return }
     const base = text(config.gatewayUrl) || DEFAULTS.gatewayUrl
+    startupProbeDone = true
     log(`启动重测：${list.length} 个模型，后台进行`)
     void runProbe({
       list, base, key,
@@ -3454,9 +4063,14 @@ export function apply(ctx, rawConfig) {
        * 为什么不是立刻：`refresh` 刚结束，余额查询（异步）可能还在路上，
        * 而探测本身要占用网关与上游账号。错开 5 秒能让启动阶段的三股流量
        * （模型清单、余额、探测）不叠在一起——对风控更友好，也不影响分层。
+       *
+       * 另外：`startStartupProbe` 现在会在「Key 没就绪 / 候选池为空」时**不置位**
+       * 标志直接返回，所以下一次分层成功时还能再试一次（见 `refreshOnce` 末尾）。
        */
-      const timer = setTimeout(() => { try { startStartupProbe() } catch { /* 探测失败不影响启动 */ } }, 5000)
-      timer.unref?.()
+      if (!startupProbeDone) {
+        const timer = setTimeout(() => { try { startStartupProbe() } catch { /* 探测失败不影响启动 */ } }, 5000)
+        timer.unref?.()
+      }
       return
     }
     const delay = BOOT_DELAYS[bootAttempt]
@@ -3699,10 +4313,13 @@ export function apply(ctx, rawConfig) {
   void bootRefresh()
 
   const minutes = positive(config.refreshMinutes, DEFAULTS.refreshMinutes)
-  if (minutes > 0) {
-    timer = setInterval(() => { void refresh().catch(() => {}) }, minutes * 60_000)
-    timer.unref?.()
-  }
+  /**
+   * 用 `startRefreshTimer` 而不是直接 `setInterval`：定时器需要能在设置页
+   * 改动 `refreshMinutes` 之后**重建**（见该函数注释）。
+   */
+  startRefreshTimer(positive(config.refreshMinutes, DEFAULTS.refreshMinutes) > 0
+    ? Number(config.refreshMinutes)
+    : 0)
 
   try {
     ctx.effect(() => () => {
@@ -3756,7 +4373,21 @@ export function apply(ctx, rawConfig) {
       }
       next.gatewayUrl = value === '' ? DEFAULTS.gatewayUrl : value
     }
-    if (Object.hasOwn(patch, 'gatewayKey')) next.gatewayKey = String(patch.gatewayKey ?? '').trim()
+    if (Object.hasOwn(patch, 'gatewayKey')) {
+      const raw = String(patch.gatewayKey ?? '').trim()
+      /**
+       * ## 掩码不是 Key
+       *
+       * 前端可能把 `'••••••'`（或用户在它后面补了一个字符）原样提交回来。
+       * 那不是用户的意图，而是「我改了别的字段，Key 没动」——必须当作**未修改**，
+       * 否则落盘后 `resolveGatewayKey` 会把这个字面量当凭证，网关全部 401。
+       *
+       * 判据：以掩码字符（U+2022）开头，或全部由掩码字符组成。
+       * 空串是「显式清除」，仍然照常生效。
+       */
+      const looksMasked = raw !== '' && /^[\u2022•\u25cf\u25CB]+/.test(raw)
+      if (!looksMasked) next.gatewayKey = raw
+    }
     if (Object.hasOwn(patch, 'verbose')) next.verbose = patch.verbose === true
     if (Object.hasOwn(patch, 'preferExpiringCredits')) next.preferExpiringCredits = patch.preferExpiringCredits === true
     if (Object.hasOwn(patch, 'expiryLookup')) next.expiryLookup = patch.expiryLookup === true
@@ -3777,11 +4408,11 @@ export function apply(ctx, rawConfig) {
     // customModels 是字符串：用户用逗号/空格/分号分隔模型 id。保存前用 parse 归一化，
     // 让页面回显的是去重、小写后的规范形式。
     if (Object.hasOwn(patch, 'customModels')) {
-      next.customModels = parseCustomModels(patch.customModels).join(', ')
+      next.customModels = encodeMembers(parseCustomModels(patch.customModels))
     }
     // 关闭的链：只接受已知的链名，防止写入任意值。
     for (const key of ['membersFree', 'membersLow', 'membersHigh']) {
-      if (Object.hasOwn(patch, key)) next[key] = parseCustomModels(patch[key]).join(', ')
+      if (Object.hasOwn(patch, key)) next[key] = encodeMembers(parseCustomModels(patch[key]))
     }
 
     // `config` 是 const 绑定，改写它的字段而不是重新赋值——闭包里的所有
@@ -3790,6 +4421,13 @@ export function apply(ctx, rawConfig) {
     Object.assign(config, next)
     // 落盘：customModels 等设置必须活过重启。
     persistSettings(config)
+    /**
+     * 刷新间隔可能刚被改过：重建定时器。
+     *
+     * 不重建的话，把「重新分层间隔」从 30 改成 5 仍按 30 分钟跑、改成 0 也
+     * 停不掉旧定时器——而 README 承诺「改动保存后立即生效」。
+     */
+    startRefreshTimer(Number(config.refreshMinutes) > 0 ? Number(config.refreshMinutes) : 0)
     // 阈值或来源变了，立刻按新配置重算一次，页面随后读到的就是新结果。
     void refresh().catch(() => {})
     return viewConfig()
@@ -3816,19 +4454,21 @@ export function apply(ctx, rawConfig) {
     const readJson = () => new Promise(resolve => {
       const chunks = []
       let size = 0
+      let settled = false
+      const finish = value => { if (!settled) { settled = true; resolve(value) } }
       req.on('data', chunk => {
         size += chunk.length
         // 设置项都是小对象；超过 64 KiB 的一律当坏请求，避免把内存交给对方。
-        if (size > 64 * 1024) { resolve(undefined); req.destroy(); return }
+        if (size > 64 * 1024) { finish({ __tooLarge: true }); return }
         chunks.push(chunk)
       })
       req.on('end', () => {
-        if (size > 64 * 1024) { resolve(undefined); return }
+        if (size > 64 * 1024) { finish({ __tooLarge: true }); return }
         const text = Buffer.concat(chunks).toString('utf8')
-        if (text.trim() === '') { resolve({}); return }
-        try { resolve(JSON.parse(text)) } catch { resolve(undefined) }
+        if (text.trim() === '') { finish({}); return }
+        try { finish(JSON.parse(text)) } catch { finish(undefined) }
       })
-      req.on('error', () => resolve(undefined))
+      req.on('error', () => finish(undefined))
     })
 
     try {
@@ -3843,7 +4483,15 @@ export function apply(ctx, rawConfig) {
       if (method === 'GET' && route === '/diag') {
         const count = value => parseCustomModels(value).length
         return send(200, {
-          settingsFile: settingsFile(),
+          /**
+           * 只回文件名，不回绝对路径。
+           *
+           * 绝对路径会把本机用户名与目录结构暴露给任何能访问这个前缀路由的
+           * 会话——而本插件其余端点刻意「不回传敏感/本机信息」（Key 只回布尔值）。
+           * 诊断只需要知道「写到了哪个文件」，不需要知道盘符。
+           */
+          settingsFile: path.basename(settingsFile()),
+          settingsDir: '~/.dsh/dsh-baipiao-stone',
           onDiskMembers: count(loadPersistedSettings().membersFree),
           loadedMembers: count(config.membersFree),
           custom: count(config.customModels),
@@ -3898,6 +4546,15 @@ export function apply(ctx, rawConfig) {
        */
       if (method === 'POST' && route === '/probe') {
         const patch = await readJson()
+        /**
+         * 必须显式拒绝坏 body。
+         *
+         * 早先只写 `patch?.force === true`，于是「70KiB 的 body」或「根本不是
+         * JSON」都会被当成合法请求——**直接触发一轮近百模型的全量探测**，
+         * 白白消耗额度，对上游也是一串密集请求。
+         */
+        if (patch === undefined) return send(400, { error: 'request body must be a JSON object' })
+        if (patch.__tooLarge === true) return send(413, { error: 'request body is too large (max 64 KiB)' })
         const force = patch?.force === true
         const { key } = resolveGatewayKey(config.gatewayKey)
         if (key === '') return send(400, { error: '没有渠道网关 Key，无法探测' })
@@ -3909,16 +4566,30 @@ export function apply(ctx, rawConfig) {
          * 快的」，而不是只测某条链里的。
          */
         const list = probeTargets()
-        // 不 await：让它后台跑，端点立刻返回。
-        void runProbe({
+        /**
+         * 把 `runProbe` 的**真实结果**合并进应答。
+         *
+         * 早先这里是 `send(200, { started: true, candidates, ...probeSnapshot() })`，
+         * 而 `probeSnapshot()` 不含 `started`——于是 `runProbe` 返回的
+         * `{started:false, reason:'...'}` 被整个丢掉，`started` 恒为 true。
+         *
+         * 后果：前端 `started !== true` 的提示分支是死代码，「已有一轮在跑」、
+         * 「60 秒冷却」、「所有模型都已有画像」这些真实原因永远显示不出来；
+         * 前端反而进入轮询、1.5 秒后看到 running=false，最终提示「测速完成：
+         * 0 个模型」——把「没开始」显示成「测完了但一个都没测」。
+         */
+        const result = await runProbe({
           list, base, key, force,
           speedMemoryMinutes: config.speedMemoryMinutes,
           minTokensPerSecond: config.minTokensPerSecond,
           onProgress: (done, total) => {
             if (done % 25 === 0 || done === total) log(`速度探测 ${done}/${total}`)
           },
-        }).catch(error => logger.warn?.(`[baipiao] 速度探测失败：${String(error?.message ?? error)}`))
-        return send(200, { started: true, candidates: list.length, ...probeSnapshot() })
+        }).catch(error => {
+          logger.warn?.(`[baipiao] 速度探测失败：${String(error?.message ?? error)}`)
+          return { started: false, total: 0, reason: String(error?.message ?? error) }
+        })
+        return send(200, { ...probeSnapshot(), candidates: list.length, ...result })
       }
       /** 探测进度；页面轮询它来更新进度。 */
       if (method === 'GET' && route === '/probe/status') {
@@ -3941,6 +4612,7 @@ export function apply(ctx, rawConfig) {
       if (method === 'POST' && route === '/chain/toggle') {
         const patch = await readJson()
         if (patch === undefined) return send(400, { error: 'request body must be a JSON object' })
+        if (patch.__tooLarge === true) return send(413, { error: 'request body is too large (max 64 KiB)' })
         const key = String(patch?.key ?? '').trim().toLowerCase()
         if (!Object.keys(CHAIN_IDS).includes(key)) {
           return send(400, { error: `unknown chain "${key}"` })
@@ -3985,7 +4657,11 @@ export function apply(ctx, rawConfig) {
         const next = patch.checked === true
           ? [...baseline, id]
           : baseline.filter(item => item !== id)
-        config[field] = parseCustomModels(next).join(', ')
+        /**
+         * 空集合必须写成哨兵：空串的语义是「没动过 → 用自动分层全量」，
+         * 直接把空集合 join 成 '' 会把「取消最后一个」反转成「恢复全部」。
+         */
+        config[field] = encodeMembers(next)
         /**
          * Custom 只要被用户动过一次，就切到 `explicit`。
          *
@@ -3995,7 +4671,8 @@ export function apply(ctx, rawConfig) {
          */
         if (key === 'custom') config.customMode = 'explicit'
         persistSettings(config)
-        void refresh().catch(() => {})
+        // await：让页面紧跟着读到的 /state 就是变更后的结果（见下方注释）
+        await refresh().catch(() => {})
         try { ctx.emit('llm/adapters-updated') } catch { /* 老内核没有这个事件 */ }
         log(`${CHAIN_LABELS[key]}：${id} ${patch.checked === true ? '已勾选' : '已取消'}`)
         return send(200, viewConfig())
@@ -4009,6 +4686,7 @@ export function apply(ctx, rawConfig) {
       if (method === 'POST' && route === '/chain/all') {
         const patch = await readJson()
         if (patch === undefined) return send(400, { error: 'request body must be a JSON object' })
+        if (patch.__tooLarge === true) return send(413, { error: 'request body is too large (max 64 KiB)' })
         const key = String(patch?.key ?? '').trim().toLowerCase()
         if (!Object.keys(CHAIN_IDS).includes(key)) {
           return send(400, { error: `unknown chain "${key}"` })
@@ -4051,10 +4729,10 @@ export function apply(ctx, rawConfig) {
            * 「取消」永远无效。所以只要用户用复选框动过，就固定为 explicit。
            * 空集合写成哨兵，保住「我就要一条空链」的语义。
            */
-          config[field] = baselineSet.size === 0 ? NONE_SELECTED : [...baselineSet].join(', ')
+          config[field] = encodeMembers(baselineSet)
           if (key === 'custom') config.customMode = 'explicit'
           persistSettings(config)
-          void refresh().catch(() => {})
+          await refresh().catch(() => {})
           try { ctx.emit('llm/adapters-updated') } catch { /* 老内核没有这个事件 */ }
           log(`${CHAIN_LABELS[key]} 批量${patch.checked === true ? '选中' : '取消'} ${subset.length} 个`)
           return send(200, viewConfig())
@@ -4079,7 +4757,7 @@ export function apply(ctx, rawConfig) {
           if (key === 'custom') config.customMode = 'explicit'
         }
         persistSettings(config)
-        void refresh().catch(() => {})
+        await refresh().catch(() => {})
         try { ctx.emit('llm/adapters-updated') } catch { /* 老内核没有这个事件 */ }
         log(`${CHAIN_LABELS[key]} 已${patch.checked === true ? '全选' : '全不选'}`)
         return send(200, viewConfig())
@@ -4087,6 +4765,7 @@ export function apply(ctx, rawConfig) {
       if (method === 'POST' && route === '/config') {
         const patch = await readJson()
         if (patch === undefined) return send(400, { error: 'request body must be a JSON object' })
+        if (patch.__tooLarge === true) return send(413, { error: 'request body is too large (max 64 KiB)' })
         return send(200, saveConfig(patch))
       }
       return send(404, { error: 'not found' })
@@ -4179,6 +4858,68 @@ export function apply(ctx, rawConfig) {
 }
 
 /**
+ * 内核附件服务 → 图片解析器（attachment → data URL）。
+ *
+ * ## 为什么要经过内核
+ *
+ * harness 的图片块只带 `attachmentId`，**没有字节也没有 URL**；真正的文件由
+ * 内核的 `attachments` 服务管理。所以「把图发给上游」唯一正确的路径是：
+ *
+ *   `ctx.get('attachments').imageHostPath(ref)` → 读该文件 → 拼 data URL
+ *
+ * ## 为什么每次调用都重新 `ctx.get`
+ *
+ * 这是 cordis 的一个真坑：服务可能在插件 `apply` **之后**才被提供。在 apply
+ * 时读一次并缓存住，会在「那时还没有 attachments」的组合里永久降级，而且
+ * 日志里什么都看不到。所以按需查（代价可忽略）。
+ *
+ * ## 为什么要有上限与缓存
+ *
+ * 单图 8 MiB 是上游普遍收紧的请求体限制；缓存按 attachmentId（同一张图在一次
+ * 会话里会被反复引用），超过 48 条就整体清空——比维护 LRU 简单，且够用。
+ *
+ * ## 拿不到就返回 undefined
+ *
+ * 由 `resolveImageUrl` 退化为占位文本。**绝不**因为读不到图就让整个请求失败：
+ * 一张图丢了是图片问题，整轮失败是功能问题，后者严重得多。
+ *
+ * @param {object} ctx - 插件上下文
+ * @param {{warn?:(msg:string)=>void}} logger
+ * @returns {(attachment:object)=>string|undefined}
+ */
+function createImageResolver(ctx, logger) {
+  const cache = new Map()
+  const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+  return attachment => {
+    const id = String(attachment?.attachmentId ?? '')
+    if (id === '') return undefined
+    const cached = cache.get(id)
+    if (cached !== undefined) return cached
+    try {
+      const attachments = typeof ctx?.get === 'function' ? ctx.get('attachments') : undefined
+      if (attachments === undefined || typeof attachments.imageHostPath !== 'function') return undefined
+      const hostPath = attachments.imageHostPath(attachment)
+      if (typeof hostPath !== 'string' || hostPath === '') return undefined
+      const size = fs.statSync(hostPath).size
+      if (size > MAX_IMAGE_BYTES) {
+        logger.warn?.(`[baipiao] 图片 ${id} 有 ${size} 字节，超过 ${MAX_IMAGE_BYTES} 的发送上限，跳过`)
+        return undefined
+      }
+      const media = typeof attachment.mediaType === 'string' && attachment.mediaType !== ''
+        ? attachment.mediaType
+        : 'image/png'
+      const url = `data:${media};base64,${fs.readFileSync(hostPath).toString('base64')}`
+      if (cache.size > 48) cache.clear()
+      cache.set(id, url)
+      return url
+    } catch (error) {
+      logger.warn?.(`[baipiao] 读取图片 ${id} 失败：${String(error?.message ?? error)}`)
+      return undefined
+    }
+  }
+}
+
+/**
  * 一条链的执行器。切换判定只在这里，避免 prepareCall 与 stream 各写一份。
  * `held` 缓冲保证未提交的候选不泄漏给调用方。
  */
@@ -4194,7 +4935,7 @@ async function* createChainStream({ ctx, config, logger, list, model, options })
     return
   }
   const base = text(config.gatewayUrl) || DEFAULTS.gatewayUrl
-  const body = toChatBody(options)
+  const body = toChatBody(options, { resolveImage: createImageResolver(ctx, logger) })
   const tried = []
   /**
    * 本次请求已因「首字太慢」放弃的候选数。
@@ -4315,7 +5056,7 @@ async function* createChainStream({ ctx, config, logger, list, model, options })
      * 模型会被误判成慢。`firstTextAt` 是第一个正文字符到达的时刻，那之前的
      * 等待属于首字延迟，由首字超时单独管。
      */
-    const speed = { chars: 0, firstTextAt: 0, tooSlow: false }
+    const speed = { chars: 0, text: '', firstTextAt: 0, tooSlow: false }
     const minTps = Number(config.minTokensPerSecond)
     const sampleMs = positive(config.speedSampleMs, DEFAULTS.speedSampleMs)
     const speedEnabled = Number.isFinite(minTps) && minTps > 0
@@ -4330,7 +5071,16 @@ async function* createChainStream({ ctx, config, logger, list, model, options })
           committed = true
           const now = Date.now()
           if (speed.firstTextAt === 0) speed.firstTextAt = now
-          if (chunk.type === 'text-delta') speed.chars += String(chunk.text ?? '').length
+          /**
+           * 累积实际正文文本。`chars` 仍然保留（样本够不够长按字符判断），
+           * 但 token 数必须按语言折算——中文按 1 字 1 token，否则正常中文回答
+           * 会被稳定低估 3 倍、被判成慢模型（见 `estimateTps`）。
+           */
+          if (chunk.type === 'text-delta') {
+            const delta = String(chunk.text ?? '')
+            speed.text += delta
+            speed.chars += delta.length
+          }
 
           /**
            * 速度判定：观察窗口够长才下结论。
@@ -4342,7 +5092,7 @@ async function* createChainStream({ ctx, config, logger, list, model, options })
           if (speedEnabled && !speed.tooSlow) {
             const elapsed = now - speed.firstTextAt
             if (elapsed >= sampleMs) {
-              const tps = estimateTps(speed.chars, elapsed)
+              const tps = estimateTps(speed.text, elapsed)
               if (tps > 0 && tps < minTps) {
                 speed.tooSlow = true
                 controller.abort()
@@ -4432,7 +5182,7 @@ async function* createChainStream({ ctx, config, logger, list, model, options })
     if (speedEnabled && !speed.tooSlow && speed.firstTextAt > 0
       && speed.chars >= MIN_SPEED_SAMPLE_CHARS) {
       const elapsed = Math.max(1, Date.now() - speed.firstTextAt)
-      const tps = estimateTps(speed.chars, elapsed)
+      const tps = estimateTps(speed.text, elapsed)
       if (tps > 0 && tps < minTps) speed.tooSlow = true
     }
 
@@ -4483,14 +5233,14 @@ async function* createChainStream({ ctx, config, logger, list, model, options })
       const genMs = Math.max(1, Date.now() - speed.firstTextAt)
       recordSpeed(candidate.id, {
         ttfb: speed.firstTextAt - startedAt,
-        tps: estimateTps(speed.chars, genMs),
+        tps: estimateTps(speed.text, genMs),
       })
     }
     if (!speedEnabled || speed.chars === 0) {
       markFast(candidate.id)
     } else {
       const genMs = Math.max(1, Date.now() - speed.firstTextAt)
-      if (estimateTps(speed.chars, genMs) >= minTps) markFast(candidate.id)
+      if (estimateTps(speed.text, genMs) >= minTps) markFast(candidate.id)
     }
     for (const pending of held) yield pending
     return

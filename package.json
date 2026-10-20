@@ -1,6 +1,6 @@
 {
   "name": "dsh-baipiao-shigege",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "把白嫖渠道的模型按「免费 / 低积分 / 高积分」自动分成三条 1M 降级链，另加一条自定义链；四条链按实测吞吐降序、低于门槛的淘汰，账号快到期优先并轮流。",
   "type": "module",
   "main": "./index.js",
@@ -25,7 +25,8 @@
     "package.json",
     "README.md",
     "LICENSE",
-    "rankcheck.mjs"
+    "rankcheck.mjs",
+    "testenv.mjs"
   ],
   "keywords": [
     "dsh",
@@ -57,7 +58,8 @@
     "check": "node --check index.js && node --check client.js",
     "selftest": "node selftest.mjs",
     "tiercheck": "node tiercheck.mjs",
-    "rankcheck": "node rankcheck.mjs"
+    "rankcheck": "node rankcheck.mjs",
+    "speedcheck": "node speedcheck.mjs"
   },
   "engines": {
     "node": ">=20"

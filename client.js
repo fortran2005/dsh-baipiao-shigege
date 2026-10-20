@@ -78,6 +78,8 @@ window.__ModuleLoader__.load({
         gatewayUrlHint: '渠道包自带的本地 OpenAI 网关，不含 /v1',
         gatewayKey: '网关 Key',
         gatewayKeyHint: '留空则自动读取 ~/.dsh/openai-gateway/api-key',
+        gatewayKeySet: '已配置。留空表示不修改；输入新值可覆盖',
+        gatewayKeyPlaceholder: '已配置（留空不变）',
         refreshMinutes: '重新分层间隔（分钟）',
         refreshMinutesHint: '0 表示只在启动时拉取一次',
         lowMaxRate: '低积分倍率上界',
@@ -217,6 +219,8 @@ window.__ModuleLoader__.load({
         gatewayUrlHint: 'The channel pack\'s local OpenAI gateway, without /v1',
         gatewayKey: 'Gateway key',
         gatewayKeyHint: 'Leave empty to read ~/.dsh/openai-gateway/api-key',
+        gatewayKeySet: 'Configured. Leave empty to keep it, or type a new value',
+        gatewayKeyPlaceholder: 'configured (leave empty)',
         refreshMinutes: 'Re-tier interval (minutes)',
         refreshMinutesHint: '0 means fetch once at startup',
         lowMaxRate: 'Low-tier rate ceiling',
@@ -734,10 +738,19 @@ window.__ModuleLoader__.load({
     function NumberField({ label, hint, value, min, step, onCommit }) {
       const [draft, setDraft] = useState(String(value ?? ''))
       useEffect(() => { setDraft(String(value ?? '')) }, [value])
+      const reset = () => setDraft(String(value ?? ''))
       const commit = () => {
-        const next = draft.trim() === '' ? undefined : Number(draft)
-        if (next !== undefined && !Number.isFinite(next)) { setDraft(String(value ?? '')); return }
-        if (next !== undefined && min !== undefined && next < min) { setDraft(String(value ?? '')); return }
+        /**
+         * 清空输入框 = **交回默认值**。
+         *
+         * 这里必须提交 `null` 而不是 `undefined`：`JSON.stringify` 会把值为
+         * `undefined` 的键整个丢掉，宿主根本收不到这个字段——于是「清空」
+         * 变成「什么都不改」，用户以为改成功了，输入框还会被 `useEffect`
+         * 悄悄填回旧值（宿主侧那条 `null → DEFAULTS` 的分支永远走不到）。
+         */
+        const next = draft.trim() === '' ? null : Number(draft)
+        if (next !== null && !Number.isFinite(next)) { reset(); return }
+        if (next !== null && min !== undefined && next < min) { reset(); return }
         if (next !== value) onCommit(next)
       }
       return h('div', { className: 'bps_field' },
@@ -752,13 +765,14 @@ window.__ModuleLoader__.load({
     }
 
     /** 文本输入：与 NumberField 同样的「失焦/回车才提交」策略。 */
-    function TextField({ label, hint, value, onCommit }) {
+    function TextField({ label, hint, value, placeholder, onCommit }) {
       const [draft, setDraft] = useState(value ?? '')
       useEffect(() => { setDraft(value ?? '') }, [value])
       return h('div', { className: 'bps_field' },
         h('label', null, label),
         h('input', {
           type: 'text', value: draft,
+          placeholder: placeholder === undefined || placeholder === '' ? undefined : placeholder,
           onChange: event => setDraft(event.target.value),
           onBlur: () => { if (draft !== (value ?? '')) onCommit(draft) },
           onKeyDown: event => {
@@ -1207,9 +1221,22 @@ window.__ModuleLoader__.load({
                 label: t('gatewayUrl'), hint: t('gatewayUrlHint'),
                 value: config.gatewayUrl, onCommit: value => save({ gatewayUrl: value }),
               }),
+              /**
+               * 网关 Key：宿主恒回空串（不再回掩码）。
+               *
+               * 早先宿主回 `'••••••'`，这里把它当成受控 input 的值——用户点进去
+               * 补一个字符就提交了「掩码+新值」，落盘后所有网关调用 401，而界面
+               * 仍显示「已配置」，根本看不出凭证坏了。
+               *
+               * 现在用 placeholder 表达「已配置」，留空 = 不修改；想清除就输入
+               * 新值或显式清空（宿主对空串按「清除」处理）。
+               */
               h(TextField, {
-                label: t('gatewayKey'), hint: t('gatewayKeyHint'),
-                value: config.gatewayKey, onCommit: value => save({ gatewayKey: value }),
+                label: t('gatewayKey'),
+                hint: config.gatewayKeyConfigured === true ? t('gatewayKeySet') : t('gatewayKeyHint'),
+                value: config.gatewayKey,
+                placeholder: config.gatewayKeyConfigured === true ? t('gatewayKeyPlaceholder') : '',
+                onCommit: value => save({ gatewayKey: value }),
               }),
               h(NumberField, {
                 label: t('refreshMinutes'), hint: t('refreshMinutesHint'),
