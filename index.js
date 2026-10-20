@@ -125,9 +125,18 @@ export const DEFAULTS = Object.freeze({
   /**
    * 点「立即重新分层」时，是否顺带补测还没有速度数据的模型。
    *
-   * 开着才能实现「分层后每个模型都有速度可看」。关掉则只分层不测速。
+   * ## 为什么默认关闭
+   *
+   * 开着的话，每点一次「立即重新分层」就在后台跑一轮全量探测（近百个模型）。
+   * 用户并不知道自己触发了什么，而对上游平台来说那是一串密集请求——这是
+   * 账号风控里最容易被判异常的一类流量。
+   *
+   * 关掉不等于失去能力：设置页有「测速」和「重测全部」两个显式按钮，想测
+   * 的时候点一下即可；不测的时候链按倍率与已有画像排序，功能完全正常。
+   * 更关键的是，**探测是后台任务**，与用户对话的请求路径完全分离——它测不测
+   * 都不影响任何一次回答的延迟。
    */
-  autoProbeOnRefresh: true,
+  autoProbeOnRefresh: false,
   /**
    * 排序时是否优先用实测快的模型。
    *
@@ -1400,7 +1409,33 @@ export function estimateTps(chars, elapsedMs) {
  *
  * 4 路并发是实测的平衡点：90 个模型约 1~2 分钟跑完，且不会把上游打爆。
  */
-export const PROBE_CONCURRENCY = 4
+/**
+ * 探测调度的两个上限。
+ *
+ * ## 为什么不是单一的「总并发数」
+ *
+ * 风控真正在意的是**同一账号的并发**。全局队列无法表达这一点：4 个工人
+ * 从队尾随便取，相邻的常常是同一渠道，于是同一账号同时挨 4 个请求。
+ *
+ * 改成「每渠道串行」之后，单账号并发恒为 1；总并行度由渠道数决定，
+ * 不再牺牲探测速度。
+ *
+ * ## 为什么还要有上限
+ *
+ * 渠道可能有二十几个（不同平台各自独立），全放出去对上游是另一类异常
+ * 特征。8 是「够快但不夸张」的折中：近百个模型约 1–2 分钟跑完。
+ */
+export const PROBE_LANES_PER_PROVIDER = 1
+export const PROBE_MAX_PROVIDERS = 8
+
+/**
+ * 两次探测请求之间的随机间隔（毫秒）。
+ *
+ * 固定间隔本身就是机器人特征。加抖动既让时序自然，也顺手把同渠道的
+ * 请求拉开距离。上限取 500 而不是更大，是因为它直接线性拖慢探测——
+ * 而探测慢意味着「按速度排序」要等更久才准。
+ */
+export const PROBE_JITTER_MS = [200, 500]
 
 /**
  * 单次探测的等待上限。
@@ -1578,11 +1613,36 @@ export async function probeModel(modelId, deps) {
  * @param {object} deps - `{ list, base, key, force, onProgress }`
  * @returns {Promise<{started:boolean, total:number, reason?:string}>}
  */
+/**
+ * 两轮探测之间的最小间隔（毫秒）。
+ *
+ * ## 为什么需要它
+ *
+ * 用户连点「立即重新分层」或快速切换设置时，可能连续触发多轮全量探测。
+ * 每一轮都是近百个请求——叠加起来就是明显的异常流量。60 秒的冷却足以
+ * 挡住手抖式的重复触发，又不妨碍「确实想再测一次」的正常使用（等一分钟）。
+ *
+ * 注意：它**不**限制用户实际对话——探测与请求路径完全分离，这条规则
+ * 只作用于后台测速任务。
+ */
+export const PROBE_COOLDOWN_MS = 60_000
+
 export async function runProbe(deps) {
   if (probeState.running) {
     return { started: false, total: probeState.total, reason: '已有一轮探测在进行' }
   }
   const { list, base, key, force = false, onProgress } = deps
+  /**
+   * 冷却检查：只挡「非强制」的自动触发；用户显式点「重测全部」仍放行。
+   *
+   * 判断依据是上一轮的**结束**时间。距离太近就跳过，并把等待秒数回给
+   * 调用方，让日志能说清「为什么这次没测」。
+   */
+  const sinceLast = Date.now() - (probeState.finishedAt || 0)
+  if (force !== true && probeState.finishedAt > 0 && sinceLast < PROBE_COOLDOWN_MS) {
+    const wait = Math.ceil((PROBE_COOLDOWN_MS - sinceLast) / 1000)
+    return { started: false, total: 0, reason: `距上一轮探测不足 ${PROBE_COOLDOWN_MS / 1000} 秒，请 ${wait} 秒后再试` }
+  }
   const pending = (Array.isArray(list) ? list : []).filter(row => {
     if (force) return true
     return speedOf(row.id, deps) === undefined
@@ -1599,11 +1659,36 @@ export async function runProbe(deps) {
   probeState.finishedAt = 0
   probeState.queue = [...pending]
 
-  /** 单个工人：不断从队列取模型来测，直到队列空或被取消。 */
-  const worker = async () => {
-    while (!probeState.cancelled) {
-      const row = probeState.queue.shift()
-      if (row === undefined) return
+  /**
+   * 按渠道分组。
+   *
+   * 同一个 provider 的模型共享账号，所以它们必须**串行**——这是把
+   * 「单账号并发」压到 1 的关键。不同 provider 之间没有共享关系，可以并行。
+   */
+  const byProvider = new Map()
+  for (const row of pending) {
+    const provider = String(row.id ?? "").split("/")[0] || "unknown"
+    if (!byProvider.has(provider)) byProvider.set(provider, [])
+    byProvider.get(provider).push(row)
+  }
+
+  /** 随机抖动，避免精确等间隔这种机器人特征。 */
+  const jitter = () => {
+    const [lo, hi] = PROBE_JITTER_MS
+    return lo + Math.floor(Math.random() * Math.max(1, hi - lo))
+  }
+
+  /**
+   * 一个渠道的工人：串行测完自己的队列。
+   *
+   * 每次请求前等一小段随机时间。这既是抖动，也天然把同一账号的请求
+   * 拉开——不需要额外维护「上次请求时间」。
+   */
+  const providerWorker = async queue => {
+    for (const row of queue) {
+      if (probeState.cancelled) return
+      await new Promise(resolve => setTimeout(resolve, jitter()))
+      if (probeState.cancelled) return
       const result = await probeModel(row.id, { base, key })
       if (result.ok) {
         recordSpeed(row.id, { ttfb: result.ttfb, tps: result.tps })
@@ -1623,8 +1708,18 @@ export async function runProbe(deps) {
   }
 
   try {
-    const lanes = Math.min(PROBE_CONCURRENCY, pending.length)
-    await Promise.all(Array.from({ length: lanes }, () => worker()))
+    /**
+     * 渠道之间并行，渠道内串行；最多同时开 PROBE_MAX_PROVIDERS 个渠道。
+     *
+     * 用「分批」而不是「信号量」实现上限：分批更简单，且每批之间的边界
+     * 让上游看到的流量有自然起伏，而不是持续满速。
+     */
+    const groups = [...byProvider.values()]
+    for (let start = 0; start < groups.length; start += PROBE_MAX_PROVIDERS) {
+      if (probeState.cancelled) break
+      const batch = groups.slice(start, start + PROBE_MAX_PROVIDERS)
+      await Promise.all(batch.map(queue => providerWorker(queue)))
+    }
   } finally {
     probeState.running = false
     probeState.finishedAt = Date.now()
