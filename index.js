@@ -907,15 +907,15 @@ export function buildTiers(rows, config) {
    *
    * 两种模式，语义必须分清，否则「取消一个模型」会失效：
    *
-   *   - `auto`：候选池的**全集**，新上架的模型自动进来。适合「我全都要、只是
-   *     想让它按速度排」的用法；
-   *   - `explicit`：**严格等于** `customModels` 里勾选的清单。取消一个就真的
-   *     少一个——这正是用户抱怨「取消了也没用」的那个 bug 的修法。
+   *   - `auto`：候选池的**全集**，新上架的模型自动进来，成员顺序**由实测速度
+   *     决定**（用户要的是吞吐，不是手排顺序）；
+   *   - `explicit`：**严格等于** `customModels` 里勾选的清单，顺序即勾选顺序。
+   *     取消一个就真的少一个——这是「取消了也没用」那个 bug 的修法。
    *
-   * 旧版实现选择的是「清单在前、其余自动补齐」，于是取消任何一项都会被补回来，
+   * 旧版实现是「清单在前、其余自动补齐」，于是取消任何一项都会被补回来，
    * 用户永远无法把某个模型移出 Custom。现在不再补齐。
    *
-   * `__none__` 仍保留为「显式全不选」的兼容写法：它等价于 explicit + 空清单。
+   * `__none__` 是「显式全不选」的兼容写法：等价于 explicit + 空清单。
    */
   const customRaw = String(config.customModels ?? '').trim().toLowerCase()
   const customNone = customRaw === NONE_SELECTED
@@ -1929,6 +1929,13 @@ export function apply(ctx, rawConfig) {
   let catalogPeak = 0
   /** 上一次余额查询的结果；首轮为空，等价于「全部未知」。 */
   let expiryState = { annotated: [], skipped: [] }
+  /**
+   * 余额查询的代号，用来丢弃过期应答。
+   *
+   * 每次发起查询前自增；应答回来时若代号已变，说明期间用户关掉了开关或又
+   * 触发了一轮新的查询，这次应答的数据不该再写进状态。
+   */
+  let expiryGeneration = 0
   let status = {
     at: 0, ok: false, error: '', gateway: '', total: 0,
     /** 四条链里可调用的候选总数（去重后）。设置页顶部那行就显示它。 */
@@ -1966,6 +1973,14 @@ export function apply(ctx, rawConfig) {
    * 之后调用，且只比较「一个都没有」的 id。
    */
   function pruneStaleCustomModels(rows) {
+    /**
+     * 哨兵不是模型 id，不能被「查不到就删」的逻辑处理。
+     *
+     * 早期在这里直接跑 `parseCustomModels` 得到 `['__none__']`，而它当然
+     * 不在本轮清单里，于是被判成「已下架」删掉、写成空串——空串在 auto 模式
+     * 下等于「全选」，用户点的「全不选」就这样被**悄悄撤销**了。
+     */
+    if (String(config.customModels ?? '').trim().toLowerCase() === NONE_SELECTED) return
     const requested = parseCustomModels(config.customModels)
     if (requested.length === 0) return
     const list = Array.isArray(rows) ? rows : []
@@ -2163,35 +2178,61 @@ export function apply(ctx, rawConfig) {
     // 不碰其它插件的接口，本插件只靠网关清单工作。
     if (config.preferExpiringCredits !== false && config.expiryLookup !== false) {
       status = { ...status, creditsPending: true }
+      /**
+       * 本轮余额查询的代号。
+       *
+       * 余额查询是异步的，而用户可能在它落地前把开关关掉、或触发下一轮刷新。
+       * 用一个自增计数让**过期的应答被丢弃**——否则关掉开关后，在途的旧查询
+       * 仍会把 credits / creditsAt 写进去，页面显示的数字来自一个已经不该跑的
+       * 请求。
+       */
+      const generation = ++expiryGeneration
       void annotateExpiry(fetched.rows, {
         windowDays: config.expiringWindowDays,
         rpc: provider => channelRpc('credits.balances', { provider }),
       }).then(result => {
-        expiryState = result
+        /*
+         * annotateExpiry 对每个渠道单独 try/catch，所以它自身几乎不会 reject；
+         * 这里判断的是「这一轮到底有没有拿到任何渠道的余额」。
+         *
+         * 一个都没拿到时**不能**把 credits 写成 0：那会让顶部从「还剩 827」
+         * 突然变成「0」，用户以为额度被扣光了。正确做法是保留上一轮的数值，
+         * 只更新「已知/未知」计数，并且**不推进 creditsAt**——没有新数据就
+         * 没有「已更新」可言。
+         */
+        const fresh = Object.keys(result.credits ?? {}).length > 0
+        if (generation !== expiryGeneration) {
+          log('余额查询结果已过期（期间开关或刷新状态变了），丢弃')
+          return
+        }
+        expiryState = fresh ? result : expiryState
         // 用刚查到的到期数据重排一次：这一步很快（纯内存），但会让「先用
-        // 快到期的」真正生效。
-        tiers = buildTiers(fetched.rows, config)
+        // 快到期的」真正生效。没有新数据时沿用上一次的标注，不重排。
+        if (fresh) tiers = buildTiers(fetched.rows, config)
         status = {
           ...status,
           expiryKnown: result.annotated.length,
           expiryUnknown: result.skipped.length,
-          credits: summarizeCredits(result.credits),
+          credits: fresh ? summarizeCredits(result.credits) : status.credits,
           /**
-           * 这一轮余额真的落地了：打上时间戳、清掉「进行中」。
-           *
-           * 前端轮询 `/state` 比对 `creditsAt`，一变就把顶部积分换成新值——
-           * 这是「点重新分层后积分没更新」的正面修法：不是假装接口等了它，
-           * 而是让页面知道还有一个迟到的更新在路上。
+           * 只有真的拿到新数据才推进时间戳：前端拿它当「已更新」的信号，
+           * 全失败时推进会让页面把旧数字当成新数字。
            */
-          creditsAt: Date.now(),
+          creditsAt: fresh ? Date.now() : (status.creditsAt ?? 0),
           creditsPending: false,
         }
-        log(`积分到期：${result.annotated.length} 个渠道已知，${result.skipped.length} 个未知（未知的按中间优先级处理）`)
+        log(fresh
+          ? `积分到期：${result.annotated.length} 个渠道已知，${result.skipped.length} 个未知（未知的按中间优先级处理）`
+          : `本轮余额全部查询失败（${result.skipped.length} 个渠道），沿用上一轮的数值`)
         try { ctx.emit('llm/adapters-updated') } catch { /* ignore */ }
       }).catch(error => {
-        // 失败也要清掉 pending，否则页面会永远转在「更新中」。
+        /*
+         * 这条分支目前是**防御性**的：annotateExpiry 内部逐渠道吞异常，正常
+         * 情况下不会走到这里。保留它是因为「余额查询抛错」这件事一旦发生，
+         * 不清理 pending 就会让页面永远转在「更新中」——代价远比一行死代码大。
+         */
         status = { ...status, creditsPending: false }
-        logger.warn?.(`[baipiao] 余额查询失败，沿用「未知」优先级：${String(error?.message ?? error)}`)
+        logger.warn?.(`[baipiao] 余额查询异常：${String(error?.message ?? error)}`)
       })
     } else if (status.creditsPending === true) {
       /**
@@ -2208,8 +2249,9 @@ export function apply(ctx, rawConfig) {
        * 同理，进程在余额落地前被中断也会留下这个标记。所以「不查余额」不是
        * 「什么都不做」，而是明确宣告：没有在路上的余额查询。
        */
+      expiryGeneration += 1
       status = { ...status, creditsPending: false }
-      log('未开启余额查询，清掉「积分更新中」标记')
+      log('未开启余额查询，清掉「积分更新中」标记，并作废在途的余额应答')
     }
 
     return { ok: true, tiers: viewTiers() }
@@ -2900,7 +2942,14 @@ export function apply(ctx, rawConfig) {
          * 基准是空集，其余模型全被判成未勾选、整条链只剩取消后剩下的——
          * 看起来就像「点一下清空了大半条链」。
          */
-        const stored = parseCustomModels(config[field])
+        /**
+         * 哨兵 `__none__` 只是「显式全不选」的标记，不是模型 id。
+         *
+         * 把它当基线带进勾选清单，会让配置变成 `"__none__, xxx"`——功能上
+         * 还能跑（哨兵只在与整串相等时才生效），但落盘里留着一个永远不该
+         * 出现的 id，下次读配置的人会被绊住。这里先剔掉它。
+         */
+        const stored = parseCustomModels(config[field]).filter(item => item !== NONE_SELECTED)
         /**
          * 「从 auto 切到 explicit」的这一次点击，基线必须是**当前链的成员**，
          * 而不是落盘里的那份旧清单。
@@ -2950,6 +2999,51 @@ export function apply(ctx, rawConfig) {
           return send(400, { error: `unknown chain "${key}"` })
         }
         const field = key === 'custom' ? 'customModels' : `members${key[0].toUpperCase()}${key.slice(1)}`
+        /**
+         * 带 `ids` 时是**集合操作**，不是整链置位。
+         *
+         * 这是搜索批量勾选的落点：页面把筛出来的那几个 id 传上来，这里只对
+         * 它们做「加入 / 移出」，链里其它成员原样不动。
+         *
+         * 为什么不能在前端用多次 /chain/toggle 模拟：N 次请求、N 次落盘、
+         * N 次 refresh，慢且中途失败会留下半套状态。
+         */
+        const subset = Array.isArray(patch?.ids)
+          ? [...new Set(patch.ids.map(id => String(id ?? '').trim().toLowerCase()).filter(id => id !== ''))]
+          : null
+        if (subset !== null) {
+          if (subset.length === 0) return send(400, { error: 'ids must not be empty' })
+          /**
+           * 基线：主清单（未动过 / 全选）视为「候选池全集」，这样从池里移出
+           * 几个是「全集减几」而不是「只剩这几个」——直接拿空串当基线会把
+           * 其余模型意外清掉，正是搜索批量操作最容易踩的坑。
+           */
+          const stored = parseCustomModels(config[field]).filter(item => item !== NONE_SELECTED)
+          const declared = String(config[field] ?? '').trim()
+          const baselineSet = new Set(
+            declared === '' || declared.toLowerCase() === NONE_SELECTED
+              ? poolRows().map(row => String(row.id ?? '').toLowerCase())
+              : stored,
+          )
+          for (const id of subset) {
+            if (patch.checked === true) baselineSet.add(id)
+            else baselineSet.delete(id)
+          }
+          /**
+           * 集合操作后必须落到 explicit。
+           *
+           * 对 Custom 来说，auto 模式会忽略清单、把整个池子补回来——那样
+           * 「取消」永远无效。所以只要用户用复选框动过，就固定为 explicit。
+           * 空集合写成哨兵，保住「我就要一条空链」的语义。
+           */
+          config[field] = baselineSet.size === 0 ? NONE_SELECTED : [...baselineSet].join(', ')
+          if (key === 'custom') config.customMode = 'explicit'
+          persistSettings(config)
+          void refresh().catch(() => {})
+          try { ctx.emit('llm/adapters-updated') } catch { /* 老内核没有这个事件 */ }
+          log(`${CHAIN_LABELS[key]} 批量${patch.checked === true ? '选中' : '取消'} ${subset.length} 个`)
+          return send(200, viewConfig())
+        }
         if (patch.checked === true) {
           config[field] = ''
           /**

@@ -33,7 +33,21 @@ const json = Config.toJSON()
 const refs = json.refs
 const root = Object.entries(refs).find(([, r]) => r.dict)
 const fields = Object.keys(root?.[1]?.dict ?? {})
-check('设置界面有 26 个可配置项', fields.length === 26, fields.join(', '))
+/**
+ * 字段数不写死字面量。
+ *
+ * 早期这里固定成 26，结果每次新增配置项都会「测试失败」，而失败的原因不是
+ * 功能坏了，只是断言过期——这种噪声会让人忽略真正的回归。改成与 DEFAULTS
+ * 的键集对齐：多一个字段、少一个字段都会被如实报出来。
+ */
+const declared = Object.keys(DEFAULTS)
+const missing = declared.filter(key => !fields.includes(key))
+const extra = fields.filter(key => !declared.includes(key))
+check(
+  `设置界面暴露全部 ${declared.length} 个配置项`,
+  missing.length === 0 && extra.length === 0,
+  missing.length > 0 ? `schema 缺少：${missing.join(', ')}` : (extra.length > 0 ? `schema 多出：${extra.join(', ')}` : `${fields.length} 项`),
+)
 check('每个字段都有说明文字',
   Object.values(root[1].dict).every(ref => typeof refs[ref]?.meta?.description === 'string'))
 
