@@ -428,7 +428,10 @@ clearSlowModels()
 //      codearts/deepseek-v4-flash 有 7 个样本、4 次失败、tps 恒 0，却因为
 //      throughputOf 返回 undefined 而被整批保留。
 
-check('默认吞吐淘汰线是 85', DEFAULTS.excludeBelowTps === 85, String(DEFAULTS.excludeBelowTps))
+check('默认吞吐淘汰线是 70', DEFAULTS.excludeBelowTps === 70, String(DEFAULTS.excludeBelowTps))
+// 进池宽、换人严：淘汰线 70 而请求期门槛 85，这是刻意的分工
+check('请求期门槛(85) 高于淘汰线(70)', DEFAULTS.minTokensPerSecond > DEFAULTS.excludeBelowTps,
+  `${DEFAULTS.minTokensPerSecond} > ${DEFAULTS.excludeBelowTps}`)
 check('默认请求期门槛同步 85', DEFAULTS.minTokensPerSecond === 85, String(DEFAULTS.minTokensPerSecond))
 
 clearSlowModels()

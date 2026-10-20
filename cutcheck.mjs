@@ -56,7 +56,7 @@ const check = (label, ok, detail = '') => {
   if (!ok) failures += 1
 }
 
-check('默认淘汰线是 85', m.DEFAULTS.excludeBelowTps === 85, String(m.DEFAULTS.excludeBelowTps))
+check('默认淘汰线是 70', m.DEFAULTS.excludeBelowTps === 70, String(m.DEFAULTS.excludeBelowTps))
 check('默认请求期门槛同步 85', m.DEFAULTS.minTokensPerSecond === 85, String(m.DEFAULTS.minTokensPerSecond))
 
 m.restoreSpeedMemory()
