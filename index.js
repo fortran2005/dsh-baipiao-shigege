@@ -1534,7 +1534,10 @@ export function buildTiers(rows, config) {
    * `perProviderLinks` 的名额——否则「淘汰 5 个慢的」反而会把名额浪费在它们
    * 身上，链里剩下的成员数不变但可用性更差。
    */
-  const pickUsable = list => (Array.isArray(list) ? list : []).filter(row => !dropped(row)).sort(bySpeed)
+  /** 只排序、不淘汰：给「用户显式勾选」的链用（勾了就该在，只是排在后面）。 */
+  const sortOnly = list => (Array.isArray(list) ? list : []).slice().sort(bySpeed)
+  /** 淘汰 + 排序：给自动分层用。 */
+  const pickUsable = list => sortOnly((Array.isArray(list) ? list : []).filter(row => !dropped(row)))
 
   /**
    * 免费层内部：真 0 积分优先，每日额度渠道排后。
@@ -1574,7 +1577,17 @@ export function buildTiers(rows, config) {
     if (primary !== 0) return primary
     return quotaRank(a) - quotaRank(b)
   }
+  /** 自动分层用：淘汰 + 排序（免费层多一层额度偏好做同档细分）。 */
   const freeOrdered = pickUsable(free).sort(bySpeedWithQuota)
+  /**
+   * 显式勾选用：**只排序、不淘汰**。
+   *
+   * 必须从原始 `free` 出发而不是从 `freeOrdered` 出发——后者已经过滤掉了
+   * 被吞吐淘汰的模型。早先用 `sortOnly(freeOrdered)`，于是「全选」在 free 链上
+   * 仍然少了几个（实测 12 个候选只进 9 个），而 low/high/custom 是对的，
+   * 表现成「只有某一条链全选不全」这种极难定位的偏科。
+   */
+  const freeSortedAll = sortOnly(free).sort(bySpeedWithQuota)
 
   const cap = list => {
     const seen = new Map()
@@ -1621,34 +1634,37 @@ export function buildTiers(rows, config) {
   }
 
   /**
-   * 是否对某条链应用 `cap()`。
+   * ## 勾了什么，链里就是什么
    *
-   * `cap()` 是「帮你挑一批合理的候选」的启发式：单渠道最多 N 个、总数最多
-   * M 个。它只应作用于**自动分层**——用户没动过这条链时，我们替他决定。
+   * 用户对「全选 / 全不选」的要求是**纯粹的集合语义**：全选 = 下面每一个都
+   * 勾上，全不选 = 一个都不勾。所以只要用户动过复选框（`manual !== null`），
+   * 就**不再套 `cap()`、也不再套吞吐淘汰**——两道筛子都会让「勾了却不在链里」：
    *
-   * 用户一旦显式勾选，就不能再截断：勾了什么就该跑什么。否则会出现
-   * 「界面上勾了、链里没有」——因为界面列表（`eligible`）不经过 cap，
-   * 而实际成员要经过，两者不一致时，用户点全选看起来就毫无反应。
+   *   - `cap()`：每条链 40 个、单渠道 6 个。实测 low 有 35 个候选，全选后链里
+   *     只有 12 个；
+   *   - 吞吐淘汰：实测 custom 有 98 个候选，全选后只剩 33 个。
+   *
+   * 这两道筛子仍然是**自动分层**（用户没动过这条链）的核心价值：替他挑一批
+   * 合理候选、并把测出来慢的摘掉。区别就是「谁做的决定」——用户显式勾选时，
+   * 决定权在用户；他没动过时，插件替他决定。
+   *
+   * 排序仍然保留（吞吐降序），因为「先试哪个」与「要不要用它」是两件事：
+   * 用户可以全选 98 个，同时期望第一个是 200 tok/s 而不是 8 tok/s。
    */
-  const capFor = manual => (manual === null ? cap : list => list)
-
-  const freeCap = capFor(freeManual)
-  const lowCap = capFor(lowManual)
-  const highCap = capFor(highManual)
+  const assemble = (manual, autoList, manualList) =>
+    (manual === null ? demote(cap(autoList)) : demote(manualList))
 
   return {
-    free: demote(freeCap(freeOrdered)),
-    low: demote(lowCap(pickUsable(low))),
-    high: demote(highCap(pickUsable(high))),
+    free: assemble(freeManual, freeOrdered, freeSortedAll),
+    low: assemble(lowManual, pickUsable(low), sortOnly(low)),
+    high: assemble(highManual, pickUsable(high), sortOnly(high)),
     /**
-     * Custom 不 `cap`（用户在设置页勾了多少就该跑多少），但**同样按吞吐降序**
-     * 排——用户的新规则是「4 个分类都按吞吐量从大到小排序」，Custom 不例外。
+     * Custom 不走 `cap`（它本来就是「用户挑的」），但**同样按吞吐降序**排。
      *
-     * 淘汰对 Custom **同样生效**：用户的原话是「低于 50 tok/s 的直接取消选择，
-     * 不进入组合模型」——手选的清单里也不该留着测出来只有 8 tok/s 的模型。
-     * 被淘汰的模型仍留在设置页的候选列表里（只是不进链），随时能取消阈值找回。
+     * 淘汰的判断与三条价格链一致：用户没动过（auto，跟随池子）时摘掉实测慢的；
+     * 一旦他在 Custom 里勾过，就严格按他的清单来。
      */
-    custom: demote(pickUsable(custom)),
+    custom: demote(customExplicit ? sortOnly(custom) : pickUsable(custom)),
   }
 }
 
@@ -3695,6 +3711,29 @@ export function apply(ctx, rawConfig) {
     && (row.rate === undefined || row.rate <= positive(config.absurdRate, DEFAULTS.absurdRate)))
 
   /**
+   * 一条链在设置页上**列出来的全部候选**。
+   *
+   * 这是「全选」的权威范围：全选必须等于「勾上我看到的每一个」，所以后端算
+   * 全选清单时必须用**与页面同一套候选**，不能自己另算一份。
+   *
+   * 三条价格链按倍率归层（`tierOf`）；Custom 是候选池全集。两次排序都用
+   * provider + 倍率，与 `viewState().eligible` 一致——否则页面顺序与后端写入
+   * 的顺序不同，用户会看到「全选之后勾选数量对，但条目次序变了」。
+   */
+  function chainCandidates(key) {
+    const options = {
+      lowMaxRate: positive(config.lowMaxRate, DEFAULTS.lowMaxRate),
+      longContextMin: positive(config.longContextMin, DEFAULTS.longContextMin),
+    }
+    const sort = list => list.slice().sort((a, b) =>
+      String(a.provider).localeCompare(String(b.provider))
+      || (a.rate ?? 99) - (b.rate ?? 99))
+    const pool = poolRows()
+    if (key === 'custom') return sort(pool)
+    return sort(pool.filter(row => tierOf(row, options) === key))
+  }
+
+  /**
    * 候选行的形状（设置页复选框列表用）。
    *
    * `rate` 让用户看到费率，`speed` 让用户按实测速度挑模型。没测过的 `speed`
@@ -3723,6 +3762,32 @@ export function apply(ctx, rawConfig) {
    * 结果。不回传网关 Key——它已经以 `configured` 布尔值的形式出现在
    * `config` 视图里，明文没有任何一条界面需要它。
    */
+  /**
+   * 把「勾选配置字段」翻译成页面能直接用的三态。
+   *
+   * @param {string} raw - 配置里的原始字符串
+   * @param {'auto'|null} customMode - Custom 链的 auto 模式（其余传 null）
+   * @returns {{mode:'all'|'none'|'explicit'|'auto', ids:string[], count:number}}
+   */
+  function memberView(raw, customMode) {
+    if (customMode === 'auto') {
+      // Custom 的 auto：跟随候选池，不存在「勾选清单」这个概念。
+      return { mode: 'auto', ids: [], count: poolRows().length }
+    }
+    const text = String(raw ?? '').trim()
+    /**
+     * 空串 = 用户从没动过这条链 → 等于全选。
+     *
+     * 注意 Custom 的 auto 已经在上面拦掉了；这里剩下的空串只可能来自
+     * 「三条价格链从未被勾选过」。
+     */
+    if (text === '') return { mode: 'all', ids: [], count: poolRows().length }
+    // 哨兵 = 显式全不选。
+    if (text.toLowerCase() === NONE_SELECTED) return { mode: 'none', ids: [], count: 0 }
+    const ids = parseCustomModels(text)
+    return { mode: 'explicit', ids, count: ids.length }
+  }
+
   function viewState() {
     const view = key => {
       const list = membersOf(CHAIN_IDS[key])
@@ -3755,11 +3820,26 @@ export function apply(ctx, rawConfig) {
        * 复选框的初始勾选状态就读它。留空表示「用户还没动过这条链」，此时由
        * `chains[key].links` 里的自动分层结果作为初始勾选。
        */
+      /**
+       * 每条件链**用户勾选的**成员，以及「这份勾选该怎么读」。
+       *
+       * 三种状态必须能被页面无歧义地区分——否则复选框只能去猜：
+       *
+       *   - `explicit`：用户在复选框里动过，`ids` 就是**完整**的勾选清单，
+       *     「全选」时它就是候选全集、「全不选」时是空数组；
+       *   - `all`：用户没动过这条链，等于「全选」（用自动分层的候选全集）；
+       *   - `custom` 额外有 `auto` 模式（跟随池子）。
+       *
+       * 早先这里只回 `parseCustomModels(...)`，空串（=全选）与哨兵（=全不选）
+       * 都被解析成空数组，页面无法区分「一个都没勾」和「一个都没限制」，
+       * 于是退回去读 `chains[key].links`（链的实际成员）——而那份成员经过
+       * `cap` 与吞吐淘汰，天然比候选列表少，表现出来就是「点了全选只勾了一部分」。
+       */
       members: {
-        free: parseCustomModels(config.membersFree),
-        low: parseCustomModels(config.membersLow),
-        high: parseCustomModels(config.membersHigh),
-        custom: parseCustomModels(config.customModels),
+        free: memberView(config.membersFree, null),
+        low: memberView(config.membersLow, null),
+        high: memberView(config.membersHigh, null),
+        custom: memberView(config.customModels, config.customMode === 'explicit' ? 'explicit' : 'auto'),
       },
       chains: {
         free: view('free'),
@@ -4737,22 +4817,48 @@ export function apply(ctx, rawConfig) {
           log(`${CHAIN_LABELS[key]} 批量${patch.checked === true ? '选中' : '取消'} ${subset.length} 个`)
           return send(200, viewConfig())
         }
+        /**
+         * ## 全选 = 勾上**列表里现有的每一个**，语义上不留任何例外
+         *
+         * 用户的要求很明确：「全选就是选择下面所有的模型，取消全选就是一个都
+         * 不选中」。所以这里必须写成**显式全集**，而不是早先那种「写空串，
+         * 让自动分层重新挑一遍」。
+         *
+         * 写空串曾经看起来更优雅（空串 = 没动过 = 自动分层全量），但它有两个
+         * 实测可见的毛病：
+         *
+         *   1. 自动分层对三条价格链会再套一层 `cap()`（每条链 40 个、单渠道
+         *      6 个），于是「全选 35 个」之后链里只有 12 个——用户点了全选，
+         *      列表上却只勾了一半；
+         *   2. 空串与「用户从没动过」无法区分，页面无法表达「我确实全选了」。
+         *
+         * 现在：全选写 `encodeMembers(该链候选全集)`，并用 `capFor` 让显式
+         * 勾选不再被截断。
+         */
         if (patch.checked === true) {
-          config[field] = ''
+          config[field] = encodeMembers(chainCandidates(key).map(row => String(row.id ?? '').toLowerCase()))
           /**
-           * Custom 的「全选」= 回到 auto：候选池全集，新上架的自动进来。
-           * 这是唯一会让 Custom 重新变回「跟随池子」的动作。
+           * Custom 的「全选」也写**显式全集**，不再是「回到 auto」。
+           *
+           * 早先这里切到 `auto`（跟随候选池），理由是「以后新上架的模型会
+           * 自动进来」。但那与用户对全选的定义冲突：全选就该是「这些全都勾上」，
+           * 而且 `auto` 模式下 `customModels` 是空的，页面读 `members` 得到
+           * `mode: 'auto'`、勾选数量 0——用户点了全选，看起来一个都没勾上
+           * （实测：96 个候选，勾选显示 0）。
+           *
+           * 切成 explicit 还有个额外好处：它与「取消某个模型」的语义一致
+           * （取消就是真的取消，不会被 auto 补回来）。
            */
-          if (key === 'custom') config.customMode = 'auto'
+          if (key === 'custom') config.customMode = 'explicit'
         } else {
-          // 全不选：空串有「全选」语义，所以写显式哨兵。
+          // 全不选：显式哨兵（空串会被理解成「全选」）。
           config[field] = NONE_SELECTED
           /**
            * Custom 的「全不选」= explicit + 空清单。
            *
            * 关键：**链空了，但候选模型一个都不能消失**。设置页的列表来自
-           * `eligible.custom` 的候选池，与链成员无关，所以取消全部勾选后模型
-           * 仍然逐个列着，用户可以自己再挑回来。
+           * 候选池，与链成员无关，所以取消全部勾选后模型仍然逐个列着，
+           * 用户可以自己再挑回来。
            */
           if (key === 'custom') config.customMode = 'explicit'
         }

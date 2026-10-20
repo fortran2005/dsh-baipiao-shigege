@@ -22,7 +22,7 @@ const {
     buildTiers, DEFAULTS, rotate, resetRotation, clearSlowModels,
     markSlow, markFast, recordSpeed, filterDropped, rankCandidates, throughputOf,
     planAccountOrder, resetAccountRotation, isSpeedFailure,
-    speedOf, encodeMembers, toChatBody, estimateTps, countTokens,
+    speedOf, encodeMembers, toChatBody, estimateTps, countTokens, tierOf,
 } = m
 
 let failures = 0
@@ -337,6 +337,78 @@ for (const [i, messages] of emptyCases.entries()) {
 const cnTps = estimateTps('这是一个中文回答，用来验证吞吐估算是否正确。', 925)
 check('中文按 1 字 1 token', cnTps > 20, cnTps.toFixed(1) + ' tok/s')
 check('countTokens 中文 4 字 = 4', countTokens('中文测试') === 4, String(countTokens('中文测试')))
+
+// ── 8. 全选 / 全不选：纯粹的集合语义 ───────────────────────────────────
+//
+// 用户的要求：「全选就是选择下面所有的模型，取消全选就是一个都不选中」。
+// 这条不变式有两次被打破过，两次都是「显式勾选仍然被自动分层的筛子二次处理」：
+//   - cap()（每条链 40、单渠道 6）导致 low 的 35 个候选只进 12 个；
+//   - 吞吐淘汰导致 custom 的 96 个候选只进 33 个。
+// 所以这里直接断言「勾选清单 == 候选清单」，链里成员数也要相等。
+
+clearSlowModels()
+resetRotation()
+
+const setMembers = (config, key, ids) => {
+  const next = { ...config }
+  if (key === 'free') next.membersFree = ids
+  else if (key === 'low') next.membersLow = ids
+  else if (key === 'high') next.membersHigh = ids
+  else { next.customMode = 'explicit'; next.customModels = ids }
+  return next
+}
+
+/** 四条链各造 3 个候选，混入一个「会被淘汰」的慢模型，验证勾上它依然进链。 */
+recordSpeed('sel/free-fast', { ttfb: 400, tps: 150 })
+recordSpeed('sel/free-slow', { ttfb: 9000, tps: 5 })   // 会被吞吐淘汰
+recordSpeed('sel/low-fast', { ttfb: 500, tps: 120 })
+recordSpeed('sel/low-slow', { ttfb: 9000, tps: 5 })
+recordSpeed('sel/high-fast', { ttfb: 600, tps: 110 })
+recordSpeed('sel/high-slow', { ttfb: 9000, tps: 5 })
+
+const tierRow = (id, provider, rate) => ({
+  id, provider, model: id.split('/')[1], name: id,
+  rate, free: false, vision: true, contextWindow: 1000000,
+})
+const selectionRows = [
+  tierRow('sel/free-fast', 'buddy', 0),
+  tierRow('sel/free-slow', 'buddy', 0),
+  { ...tierRow('sel/low-fast', 'buddy', 0.1) },
+  { ...tierRow('sel/low-slow', 'buddy', 0.1) },
+  { ...tierRow('sel/high-fast', 'buddy', 0.9) },
+  { ...tierRow('sel/high-slow', 'buddy', 0.9) },
+]
+
+for (const key of ['free', 'low', 'high']) {
+  const ids = selectionRows
+    .filter(row => tierOf(row, { lowMaxRate: DEFAULTS.lowMaxRate, longContextMin: 1000000 }) === key)
+    .map(row => row.id)
+  const full = buildTiers(selectionRows, setMembers(DEFAULTS, key, ids.join(', ')))[key]
+  check(`全选 ${key}：勾了几个，链里就有几个（含实测慢的）`,
+    ids.length > 0 && full.length === ids.length,
+    `勾选=${ids.length} 链里=${full.length}`)
+  const none = buildTiers(selectionRows, setMembers(DEFAULTS, key, '__none__'))[key]
+  check(`全不选 ${key}：链里为 0`, none.length === 0, '链里=' + none.length)
+}
+
+// Custom：勾上全部候选（含会被淘汰的）也必须全在
+const customIds = selectionRows.map(row => row.id)
+const customFull = buildTiers(selectionRows, {
+  ...DEFAULTS, customMode: 'explicit', customModels: customIds.join(', '),
+}).custom
+check('全选 custom：勾了几个，链里就有几个（含实测慢的）',
+  customFull.length === customIds.length, `勾选=${customIds.length} 链里=${customFull.length}`)
+const customNone = buildTiers(selectionRows, {
+  ...DEFAULTS, customMode: 'explicit', customModels: '__none__',
+}).custom
+check('全不选 custom：链里为 0', customNone.length === 0, '链里=' + customNone.length)
+
+// 自动分层（用户没动过）仍然要淘汰：这是「自动」与「手动」的分界
+const autoLow = buildTiers(selectionRows, { ...DEFAULTS, membersLow: '' }).low
+check('自动分层仍然淘汰慢模型（手动与自动的分界）',
+  !autoLow.some(row => row.id === 'sel/low-slow'), autoLow.map(r => r.id).join(','))
+
+clearSlowModels()
 
 clearSlowModels()
 console.log(failures === 0 ? '\n全部通过' : '\n' + failures + ' 项失败')

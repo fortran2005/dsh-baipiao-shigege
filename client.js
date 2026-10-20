@@ -648,7 +648,15 @@ window.__ModuleLoader__.load({
             // indeterminate 由 ref 设置：它表示「部分选中」，比显示未选中更诚实。
             ref: el => { if (el != null) el.indeterminate = someOn && !allOn },
             // 搜索时把筛选结果一并带上：后端据此只动这几个，不碰整条链。
-            onChange: () => onToggleAll(!allOn, filtering ? filtered.map(row => row.id) : undefined),
+            /**
+             * 每次都把**明确的 id 列表**传上去（不再传 undefined 表示「整条链」）。
+             *
+             * 两种语义原来混在一起：「不传 ids」= 整链置位，绕过后端对候选范围的
+             * 计算；「传 ids」= 只动这几个。既然用户的要求是「全选就是选中下面
+             * 全部」，那就统一按**列表**来做集合操作——页面看到哪些，就传哪些。
+             * 搜索时自然只作用于筛选结果，这正是原来的设计意图。
+             */
+            onChange: () => onToggleAll(!allOn, (filtering ? filtered : list).map(row => row.id)),
           }),
           h('span', { className: 'bps_cardname', style: accent === undefined ? undefined : { color: accent } },
             accent === undefined ? null : h('span', { className: 'bps_dot', style: { background: accent } }),
@@ -1001,9 +1009,39 @@ window.__ModuleLoader__.load({
        * 完整，只是没有一项被勾上。
        */
       const membersOf = (key, st, cfg) => {
+        /**
+         * ## 复选框状态必须读「用户勾了什么」，不是「链里实际有什么」
+         *
+         * 早先三条价格链读 `st.chains[key].links`（链的实际成员）。那份成员是
+         * 经过 `cap()`（每条链 40、单渠道 6）与吞吐淘汰之后的**结果**，天然比
+         * 候选列表少——实测 low 的 35 个候选只有 12 个在链里，于是用户点「全选」
+         * 之后，列表上只勾了 12 个，看起来就是「全选不起作用」。
+         *
+         * 现在宿主在 `state.members[key]` 里直接回一份三态：
+         *
+         *   - `mode: 'all'`      → 没动过，等于全选；勾上当前候选全集
+         *   - `mode: 'none'`     → 显式全不选；一个都不勾
+         *   - `mode: 'explicit'` → `ids` 就是完整勾选清单
+         *   - `mode: 'auto'`     → 仅 Custom：跟随候选池
+         */
+        const view = st?.members?.[key]
+        if (view !== null && typeof view === 'object') {
+          if (view.mode === 'none') return []
+          if (view.mode === 'explicit') return Array.isArray(view.ids) ? view.ids : []
+          // all / auto：勾上候选全集（由调用方通过候选列表对齐）。
+          const pool = key === 'custom'
+            ? (st?.eligible?.custom ?? st?.available ?? st?.chains?.custom?.links ?? [])
+            : (st?.eligible?.[key] ?? [])
+          const ids = pool.map(row => String(row.id ?? '').toLowerCase())
+          if (ids.length > 0) return ids
+          return (st?.chains?.[key]?.links ?? []).map(row => row.id)
+        }
+        /**
+         * 兜底：旧宿主没有 `state.members`（升级前）时仍按老规则读配置字段，
+         * 至少不会把「全不选」误显示成全选。
+         */
         if (key === 'custom') {
           const raw = String(cfg?.customModels ?? '').trim().toLowerCase()
-          // 哨兵 = 用户显式全不选；空串 = 没动过（auto，跟随池子）。
           if (raw === '__none__') return []
           if (raw === '') return (st?.chains?.custom?.links ?? []).map(row => row.id)
           return parseList(raw)
