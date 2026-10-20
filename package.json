@@ -1,6 +1,6 @@
 {
   "name": "dsh-baipiao-shigege",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "把白嫖渠道的模型按「免费 / 低积分 / 高积分」自动分成三条 1M 降级链，另加一条自定义链；按实测吞吐排序，倍率变化时自动重新分层。",
   "type": "module",
   "main": "./index.js",
