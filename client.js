@@ -293,6 +293,7 @@ window.__ModuleLoader__.load({
 .bps_checkbox{flex:0 0 auto;margin:0;accent-color:#9B6BFF;}
 .bps_linkrow{display:flex;align-items:center;gap:7px;}
 .bps_linkid{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bps_linkon{color:var(--dsw-alias-state-business-primary);font-weight:600;}
 .bps_mini{flex:0 0 auto;border:1px solid var(--dsw-alias-border-l1);background:transparent;
   color:var(--dsw-alias-label-tertiary);border-radius:6px;padding:0 6px;font:inherit;
   font-size:12px;line-height:17px;cursor:pointer;}
@@ -635,7 +636,10 @@ window.__ModuleLoader__.load({
                   type: 'checkbox', checked: on, disabled: busy,
                   onChange: () => onToggleOption(row.id, !on),
                 }),
-                h('span', { className: 'bps_linkid' }, row.id),
+                h('span', {
+                  // 已勾选的用加粗区分：位置不动，但「选没选」依然一眼可辨。
+                  className: on ? 'bps_linkid bps_linkon' : 'bps_linkid',
+                }, row.id),
                 row.vision === true ? h('span', { className: 'bps_picktag' }, '👁') : null,
                 // 实测速度：首字延迟 + 吞吐。没测过显示「—」，测过就一眼看出快慢。
                 h('span', {
@@ -954,7 +958,6 @@ window.__ModuleLoader__.load({
           const lower = String(id).toLowerCase()
           if (!byId.has(lower)) byId.set(lower, { id, rate: null, vision: undefined })
         }
-        const selected = new Set(selectedIds.map(x => String(x).toLowerCase()))
         return [...byId.values()].sort((a, b) => {
           /**
            * 排序：**测过速度的优先，首字快的在前**。
@@ -963,14 +966,15 @@ window.__ModuleLoader__.load({
            * 看到哪些快。没测过的排在后面（按 id 稳定排序），等探测补齐。
            */
           /**
-           * 排序：**已勾选的排最前**，然后测过速度的优先、首字快的在前。
+           * 排序：**位置必须稳定**，与勾选状态无关。
            *
-           * 「已选优先」是用户明确要的：勾了哪些模型，列表顶部就该是它们，
-           * 不用在一大堆候选里回头找自己刚加进去的那几个。
+           * 这里曾经按「已勾选优先」排序，结果用户点第 3 行时，那一行立刻
+           * 跳到第 1 行——视觉上就是「我点哪儿都是选中第一个」。可变列表里
+           * 让被点的对象从手指底下移走，是纯粹的干扰。
+           *
+           * 所以只按实测速度（快的在前）排，同速按 id 稳定排序。想找已选项
+           * 用搜索框；已选项用加粗名字标记，不靠位置。
            */
-          const pa = selected.has(String(a.id).toLowerCase())
-          const pb = selected.has(String(b.id).toLowerCase())
-          if (pa !== pb) return pa ? -1 : 1
           const sa = a.speed?.ttfb
           const sb = b.speed?.ttfb
           const ha = Number.isFinite(sa)
