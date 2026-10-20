@@ -65,7 +65,8 @@ window.__ModuleLoader__.load({
         probeForce: '重测全部',
         probeStop: '停止测速',
         probeRunning: '测速中 {done}/{total}',
-        probeDone: '测速完成：{n} 个模型',
+        probeDone: '测速完成：{n} 个模型；已按 {cut} tok/s 收敛勾选（{changed}）',
+        probeCutNone: '无需收敛',
         probeIdle: '测速：测出每个模型的实际速度，用来按速度挑模型',
         probeEmpty: '所有模型都已有速度数据',
         speedCol: '实测速度',
@@ -102,7 +103,7 @@ window.__ModuleLoader__.load({
         minTokensPerSecond: '最低速度（tokens/秒）',
         minTokensPerSecondHint: '输出低于这个速度就换下一个模型，并把它排到链尾；0 = 不判定',
         excludeBelowTps: '吞吐淘汰线（tokens/秒）',
-        excludeBelowTpsHint: '实测吞吐低于这个值的模型直接移出全部链（等于取消选择）；没测过的模型不受影响，0 = 不淘汰',
+        excludeBelowTpsHint: '实测吞吐低于这个值的模型直接移出全部链（等于取消选择）。点「重测全部」跑完后，四条链的勾选会自动收紧到通过这条线的模型；没测过的模型不受影响，0 = 不淘汰',
         fastBandSize: '快速档大小（同时轮换几个）',
         fastBandSizeHint: '只有吞吐最高的前 N 个模型参与轮流调用。档内轮流当链首，档外只在档内全失败时兜底。1 = 永远只用最快的那个',
         throughputBandTps: '吞吐分档档宽（tokens/秒）',
@@ -206,7 +207,8 @@ window.__ModuleLoader__.load({
         probeForce: 'Re-measure all',
         probeStop: 'Stop',
         probeRunning: 'Measuring {done}/{total}',
-        probeDone: 'Done: {n} models measured',
+        probeDone: 'Done: {n} models measured; selection narrowed to >= {cut} tok/s ({changed})',
+        probeCutNone: 'nothing to narrow',
         probeIdle: "Measure each model's real speed so you can pick fast ones",
         probeEmpty: 'All models already have speed data',
         speedCol: 'Measured speed',
@@ -243,7 +245,7 @@ window.__ModuleLoader__.load({
         minTokensPerSecond: 'Minimum speed (tokens/s)',
         minTokensPerSecondHint: 'Slower than this and the chain moves on, demoting the model to the tail; 0 disables',
         excludeBelowTps: 'Throughput cut-off (tokens/s)',
-        excludeBelowTpsHint: 'Models measured below this are removed from every chain (same as unselecting them). Unmeasured models are never dropped; 0 disables',
+        excludeBelowTpsHint: 'Models measured below this are removed from every chain. After a full re-measure, each chain is auto-narrowed to the models above this line. Unmeasured models are kept; 0 disables',
         fastBandSize: 'Fast band size (how many rotate)',
         fastBandSizeHint: 'Only the N fastest models rotate as chain head. The rest stay as fallback. 1 = always the single fastest',
         throughputBandTps: 'Throughput band width (tokens/s)',
@@ -867,6 +869,8 @@ window.__ModuleLoader__.load({
        * 而且链的排序也会变。
        */
       const startProbe = async force => {
+        /** 当前门槛，用于完成提示（配置尚未加载时退回默认 85）。 */
+        const cutCutThreshold = Number(config?.excludeBelowTps ?? 85)
         setBusy(true); setNotice(''); setError('')
         try {
           const started = await api.probe(force)
@@ -876,15 +880,37 @@ window.__ModuleLoader__.load({
             return
           }
           setProbe({ running: true, done: 0, total: started.total ?? 0, finishedAt: 0 })
-          // 轮询直到宿主说「跑完了」。
+          /**
+           * 轮询直到宿主说「跑完了」。
+           *
+           * 同时把**最后一次**的快照留在局部变量里：完成提示要说「测了多少个」，
+           * 而渲染闭包里的 `probe.total` 是点击那一刻的值（正常首次点击恒为 0），
+           * 用它拼提示会永远显示「测速完成：0 个模型」。
+           */
+          let last = { running: true, done: 0, total: started.total ?? 0, finishedAt: 0 }
           for (;;) {
             await new Promise(r => setTimeout(r, 1500))
             const s = await api.probeStatus()
-            setProbe({ running: s.running === true, done: s.done ?? 0, total: s.total ?? 0, finishedAt: s.finishedAt ?? 0 })
-            if (s.running !== true) break
+            last = { running: s.running === true, done: s.done ?? 0, total: s.total ?? 0, finishedAt: s.finishedAt ?? 0 }
+            setProbe(last)
+            if (last.running !== true) break
           }
           await refreshBoth()
-          setNotice(t('probeDone').replace('{n}', String(probe.total || 0)))
+          /**
+           * 完成提示带上「收敛结果」。
+           *
+           * 用户点「重测全部」之后最想知道的是「现在到底选中了多少个」，
+           * 而不是「测了多少个」。宿主在 /probe 的应答里回了 cut 明细
+           * （哪条链被收敛、各取消了几个），这里如实转述。
+           */
+          const cut = started?.cut ?? null
+          const changedText = cut !== null && Array.isArray(cut.changed) && cut.changed.length > 0
+            ? cut.changed.map(k => k + ' -' + (cut.dropped?.[k] ?? 0)).join(' / ')
+            : t('probeCutNone')
+          setNotice(t('probeDone')
+            .replace('{n}', String(last.total || 0))
+            .replace('{cut}', String(cutCutThreshold))
+            .replace('{changed}', changedText))
         } catch (caught) {
           setError(t('saveFailed').replace('{reason}', String(caught?.message ?? caught)))
         } finally { setBusy(false) }

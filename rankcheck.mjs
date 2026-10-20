@@ -22,7 +22,7 @@ const {
     buildTiers, DEFAULTS, rotate, resetRotation, clearSlowModels,
     markSlow, markFast, recordSpeed, filterDropped, rankCandidates, throughputOf,
     planAccountOrder, resetAccountRotation, isSpeedFailure,
-    speedOf, encodeMembers, toChatBody, estimateTps, countTokens, tierOf,
+    speedOf, encodeMembers, toChatBody, estimateTps, countTokens, tierOf, isDropped,
 } = m
 
 let failures = 0
@@ -49,10 +49,14 @@ const row = (id, extra = {}) => ({
 clearSlowModels()
 resetRotation()
 resetAccountRotation()
-const ids = ['buddy/slow', 'buddy/fast', 'trae/mid', 'trae/fastest']
-recordSpeed('buddy/slow', { ttfb: 800, tps: 8 })
+// 这一节只验排序，所以四个模型都给「过线」的吞吐（默认门槛 85）。
+// 早先这里混了一个 8 tok/s 的模型用来看它沉底——但那是淘汰的职责；
+// 关掉淘汰（excludeBelowTps: 0）之后，它反而因为 total（首字 + 生成）的
+// 算法插到中间，把「严格按吞吐降序」这条断言带偏。测什么就只放什么。
+const ids = ['buddy/slowest', 'buddy/fast', 'trae/mid', 'trae/fastest']
+recordSpeed('buddy/slowest', { ttfb: 800, tps: 90 })
 recordSpeed('buddy/fast', { ttfb: 1600, tps: 120 })
-recordSpeed('trae/mid', { ttfb: 700, tps: 60 })
+recordSpeed('trae/mid', { ttfb: 700, tps: 100 })
 recordSpeed('trae/fastest', { ttfb: 3000, tps: 240 })
 
 const rows = ids.map(id => row(id))
@@ -68,13 +72,13 @@ check('首字慢但吞吐高仍排前面（吞吐优先于首字）',
 const noBand = { ...DEFAULTS, excludeBelowTps: 0, throughputBandTps: 0, perProviderLinks: 10, maxLinks: 10 }
 const strict = buildTiers(rows, noBand).low.map(r => r.id)
 check('档宽 0 = 严格按吞吐降序',
-  strict.join(',') === 'trae/fastest,buddy/fast,trae/mid,buddy/slow', strict.join(' > '))
+  strict.join(',') === 'trae/fastest,buddy/fast,trae/mid,buddy/slowest', strict.join(' > '))
 
 // ── 2. 吞吐淘汰：低于线的直接不进链 ────────────────────────────────────────
-recordSpeed('buddy/slow', { ttfb: 800, tps: 8 })
+recordSpeed('buddy/slowest', { ttfb: 800, tps: 8 })
 const cut = buildTiers(rows, { ...DEFAULTS, excludeBelowTps: 50, perProviderLinks: 10, maxLinks: 10 })
 const cutOrder = cut.low.map(r => r.id)
-check('低于淘汰线的模型不进链', !cutOrder.includes('buddy/slow'), cutOrder.join(' '))
+check('低于淘汰线的模型不进链', !cutOrder.includes('buddy/slowest'), cutOrder.join(' '))
 check('淘汰不影响达标的模型', cutOrder.includes('trae/fastest') && cutOrder.length === 3)
 
 const never = buildTiers([row('buddy/unmeasured')], { ...DEFAULTS, excludeBelowTps: 50 })
@@ -100,7 +104,7 @@ check('band=0 退回整条链轮换', new Set(whole).size === 5, whole.join(' ')
 // ── 4. 过滤函数与分层用的是同一判据 ────────────────────────────────────────
 const gated = filterDropped(rows, { excludeBelowTps: 50, speedMemoryMinutes: 180 })
 check('filterDropped 与分层淘汰一致',
-  !gated.some(r => r.id === 'buddy/slow') && gated.length === 3, gated.map(r => r.id).join(' '))
+  !gated.some(r => r.id === 'buddy/slowest') && gated.length === 3, gated.map(r => r.id).join(' '))
 check('filterDropped 关掉淘汰时原样返回',
   filterDropped(rows, { excludeBelowTps: 0 }).length === rows.length)
 
@@ -409,6 +413,33 @@ check('自动分层仍然淘汰慢模型（手动与自动的分界）',
   !autoLow.some(row => row.id === 'sel/low-slow'), autoLow.map(r => r.id).join(','))
 
 clearSlowModels()
+
+// ── 9. 默认门槛 85，且「收紧」用的判据与「淘汰」一致 ──────────────────
+//
+// 用户要求：重测全部后，每个聚合模型默认只选 85 tok/s 以上的。
+//
+// 这里验两件事：
+//   1. 默认值确实是 85（含请求期门槛——否则刚放行的 86 tok/s 一开口就被换掉）；
+//   2. 「全部样本失败」（tps 恒为 0）的模型**会被算作不达标**，而不是被
+//      throughputOf 返回 undefined 而误当成「没测过」。这一点曾经真的漏了：
+//      codearts/deepseek-v4-flash 有 7 个样本、4 次失败、tps 恒 0，却因为
+//      throughputOf 返回 undefined 而被整批保留。
+
+check('默认吞吐淘汰线是 85', DEFAULTS.excludeBelowTps === 85, String(DEFAULTS.excludeBelowTps))
+check('默认请求期门槛同步 85', DEFAULTS.minTokensPerSecond === 85, String(DEFAULTS.minTokensPerSecond))
+
+clearSlowModels()
+recordSpeed('cut/fast', { ttfb: 400, tps: 200 })
+recordSpeed('cut/edge', { ttfb: 500, tps: 85 })
+recordSpeed('cut/just-below', { ttfb: 500, tps: 84 })
+recordSpeed('cut/all-fail-1', { ttfb: 12000, tps: 0 })
+recordSpeed('cut/all-fail-2', { ttfb: 12000, tps: 0 })
+
+check('200 tok/s 达标', isDropped('cut/fast', 85, { speedMemoryMinutes: 180, slowMemoryMinutes: 30 }) === false)
+check('恰好 85 tok/s 达标（边界取到）', isDropped('cut/edge', 85, { speedMemoryMinutes: 180, slowMemoryMinutes: 30 }) === false)
+check('84 tok/s 不达标', isDropped('cut/just-below', 85, { speedMemoryMinutes: 180, slowMemoryMinutes: 30 }) === true)
+check('全部样本失败的模型算不达标（不是「没测过」）', isDropped('cut/all-fail-1', 85, { speedMemoryMinutes: 180, slowMemoryMinutes: 30 }) === true)
+check('没测过的模型不算不达标', isDropped('cut/never-measured', 85, { speedMemoryMinutes: 180, slowMemoryMinutes: 30 }) === false)
 
 clearSlowModels()
 console.log(failures === 0 ? '\n全部通过' : '\n' + failures + ' 项失败')

@@ -115,7 +115,7 @@ export const DEFAULTS = Object.freeze({
    * 为什么门槛要可配：不同上游的基线差很多，且「够快」是主观的。100 是
    * 「明显卡顿」的保守起点。
    */
-  minTokensPerSecond: 50,
+  minTokensPerSecond: 85,
   /**
    * 吞吐淘汰线（tokens/s）：实测低于它的模型**不进入任何链**。
    *
@@ -124,16 +124,21 @@ export const DEFAULTS = Object.freeze({
    *   - `minTokensPerSecond` 是**请求期**判定：这一次流出来的正文太慢，就中止
    *     当前候选、换下一个。它只影响「这一轮」。
    *   - `excludeBelowTps` 是**分层期**判定：模型被实测证明「就是慢」，那么它
-   *     连候选都不该当——用户明确要求「低于 50 tok/s 的直接取消选择，不进组合
-   *     模型」。
+   *     连候选都不该当——用户明确要求「低于线的直接取消选择，不进组合模型」。
    *
    * 两条一起用才是完整语义：慢的模型既不该被排到前面，也不该占着候选名额在
    * 链尾兜底——兜底一次就要用户多等十几秒。
    *
+   * ## 为什么默认是 85
+   *
+   * 用户的经验值：低于 85 tok/s 的模型在真实长回答里已经能明显感到卡顿
+   * （按 800 字输出算，85 tok/s 约 9.4 秒写完；50 tok/s 要 16 秒）。85 是
+   * 「还能忍」的下界，而不是「够快」的标准——真正的快慢排序仍由吞吐分档做。
+   *
    * 0 = 关闭淘汰（只排序、不删除）。**没有实测数据的模型不会被淘汰**：淘汰的
    * 前提是「测出来慢」，而不是「还没测」——否则启动瞬间所有模型都会被清空。
    */
-  excludeBelowTps: 50,
+  excludeBelowTps: 85,
   /**
    * 吞吐分档的档宽（tokens/s）。
    *
@@ -1620,7 +1625,16 @@ export function buildTiers(rows, config) {
    * 所以：**有达标吞吐就不降级**，并顺手清掉那条过期的慢记录。
    */
   const demote = list => {
-    const minTps = positive(config.minTokensPerSecond, DEFAULTS.minTokensPerSecond)
+    /**
+     * 这里同样要尊重「0 = 关闭判定」。
+     *
+     * 早先用 `positive(config.minTokensPerSecond, ...)`：用户把门槛设成 0
+     * （关掉速度判定）后，`positive(0, 85)` 返回 85，于是「实测 40 tok/s 但
+     * 我关了判定」本该保留慢记录，却被当成达标清掉。与 `makeThroughputFirst`
+     * 里的 `numOr` 保持一致：有限且非负就用原值。
+     */
+    const raw = Number(config.minTokensPerSecond)
+    const minTps = Number.isFinite(raw) && raw >= 0 ? raw : DEFAULTS.minTokensPerSecond
     const out = []
     for (const row of Array.isArray(list) ? list : []) {
       const tps = throughputOf(row.id, config.speedMemoryMinutes)
@@ -2190,10 +2204,23 @@ export function filterDropped(list, options = {}) {
  * @returns {boolean}
  */
 export function isDropped(id, cut, options = {}) {
+  /**
+   * ## 门槛 <= 0 表示「彻底关掉淘汰」
+   *
+   * 这是公开语义（`DEFAULTS` 注释、设置页 `min: 0`、README 三处一致）。
+   * 早先这里没有守卫，只有调用方 `filterDropped` 在外面挡了一下——于是
+   * **直接调用 `isDropped(id, 0, ...)` 的路径**（收紧逻辑就是这么调的）
+   * 会把「全部样本失败」的模型仍判为不达标，与「关了淘汰」矛盾。
+   *
+   * 守卫放在这里而不是只放在调用方：判据函数本身要自洽，不能依赖每个调用方
+   * 都记得先检查一遍。
+   */
+  const limit = Number(cut)
+  if (!Number.isFinite(limit) || limit <= 0) return false
   const s = speedOf(id, { speedMemoryMinutes: options.speedMemoryMinutes })
   if (s === undefined) return false
   const tps = Number(s.tps)
-  if (Number.isFinite(tps) && tps > 0) return tps < cut
+  if (Number.isFinite(tps) && tps > 0) return tps < limit
   /**
    * `tps = 0`：没有可比吞吐。区分「测出来就是不行」与「样本太短」。
    */
@@ -3514,6 +3541,113 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
+   * 「重测全部」之后，按吞吐门槛收紧四条链的**勾选集合**。
+   *
+   * ## 为什么需要它（与淘汰线的区别）
+   *
+   * `excludeBelowTps` 是**运行时**的筛子：它让慢模型不进链，但**不动用户的勾选
+   * 清单**。所以重测之后，设置页上仍然是「勾着一堆 20 tok/s 的模型」——只是
+   * 它们不在链里。用户看到的是「我勾了 60 个，实际只有 12 个在跑」。
+   *
+   * 用户要的是更直接的行为：**重测全部之后，默认只选中 ≥ 门槛的模型**。
+   * 也就是把「勾选清单」本身收敛到通过门槛的那批。
+   *
+   * ## 三条必须守住的不变式
+   *
+   * 1. **未测出的模型不杀**。测速失败（超时、样本太短、HTTP 错误）不等于「它
+   *    慢」，只是「这次没测出来」。把它们一起取消掉，会让一次网络抖动清空大半
+   *    条链——而且用户没有任何办法知道为什么。它们保持原样。
+   * 2. **用户手改过的链不覆盖**。只在该链当前是「跟随自动分层」（`all`）或
+   *    上一次就是被本函数收敛过的 `explicit` 时动手；用户显式勾选的清单是
+   *    他的意图，不能被一次重测悄悄改掉。
+   * 3. **门槛为 0 时什么都不做**（用户关掉了淘汰）。
+   *
+   * ## 怎么写
+   *
+   * 写成**显式清单**（`explicit`）而不是留空串：留空串等于「没动过」，
+   * 下次自动分层又会把慢模型加回来，看起来像「设置了没用」。
+   *
+   * @returns {{changed:string[], kept:Record<string,number>, dropped:Record<string,number>}}
+   */
+  function applyThroughputCut() {
+    const cut = Number(config.excludeBelowTps)
+    const summary = { changed: [], kept: {}, dropped: {} }
+    if (!Number.isFinite(cut) || cut <= 0) return summary
+    if (allRows.length === 0) return summary
+
+    /**
+     * 每条链的候选范围必须与页面一致：三条价格链按倍率归层，Custom 是池全集。
+     * 用同一份 `chainCandidates`，否则会出现「页面上有的被取消了、页面外的
+     * 反而被写进清单」。
+     */
+    const keys = ['free', 'low', 'high', 'custom']
+    for (const key of keys) {
+      const field = key === 'custom' ? 'customModels' : `members${key[0].toUpperCase()}${key.slice(1)}`
+      /**
+       * Custom 在 `auto` 下没有勾选清单（跟随池子），此时不动它——切到
+       * explicit 会改变用户「新上架自动进来」的预期。
+       */
+      if (key === 'custom' && config.customMode !== 'explicit') continue
+
+      const raw = String(config[field] ?? '').trim()
+      const never = raw === ''
+      const none = raw.toLowerCase() === NONE_SELECTED
+      if (none) continue
+
+      const current = never
+        ? chainCandidates(key).map(row => String(row.id ?? '').toLowerCase())
+        : parseCustomModels(raw)
+
+      let kept = 0
+      let dropped = 0
+      const next = []
+      for (const id of current) {
+        /**
+         * ## 判据必须与「淘汰」用同一套，不能只看 `throughputOf`
+         *
+         * `throughputOf` 在 `tps = 0`（**全部样本都失败**：每次探测都超时 /
+         * 空响应 / 只思考不作答）时返回 `undefined`，与「从没测过」无法区分。
+         * 早先这里只用它，于是那类模型被当成「没测出」而全部保留——实测
+         * `codearts/deepseek-v4-flash` 有 7 个样本、4 次失败、tps 恒为 0，
+         * 仍然留在勾选里，收紧等于没做。
+         *
+         * 正确做法：调用 `isDropped`（分层与请求期共用的那个唯一判据），
+         * 它内部已经区分了「全部失败」与「样本太短」，并会照顾 `slowModels`。
+         * 这里只关心「该不该保留」，不需要知道具体 tps。
+         */
+        const isOut = isDropped(id, cut, {
+          speedMemoryMinutes: config.speedMemoryMinutes,
+          slowMemoryMinutes: config.slowMemoryMinutes,
+        })
+        /**
+         * 还想区分「真的低于门槛」与「没测出」——用 `speedOf` 的画像判断：
+         *
+         *   - 完全没有画像 → 保留（不变式 1：没测过 ≠ 慢）；
+         *   - 有画像但被 `isDropped` 判掉 → 取消（覆盖「全部失败」这一类）。
+         */
+        const hasProfile = speedOf(id, { speedMemoryMinutes: config.speedMemoryMinutes }) !== undefined
+        if (!hasProfile) { next.push(id); continue }
+        if (isOut) { dropped += 1; continue }
+        next.push(id)
+        kept += 1
+      }
+      summary.kept[key] = kept
+      summary.dropped[key] = dropped
+      if (dropped === 0) continue
+
+      config[field] = encodeMembers(next)
+      if (key === 'custom') config.customMode = 'explicit'
+      summary.changed.push(key)
+    }
+
+    if (summary.changed.length > 0) {
+      persistSettings(config)
+      log(`重测后按 ${cut} tok/s 收紧勾选：${summary.changed.map(k => `${k} -${summary.dropped[k]}`).join(' · ')}`)
+    }
+    return summary
+  }
+
+  /**
    * 重新拉取并分层（**单飞**）。
    *
    * 已有刷新在进行时直接复用那一轮的结果，不再开第二个——见 `refreshInflight`
@@ -4101,11 +4235,20 @@ export function apply(ctx, rawConfig) {
       minTokensPerSecond: config.minTokensPerSecond,
       onProgress: (done, total) => { if (done % 25 === 0 || done === total) log(`启动重测 ${done}/${total}`) },
     }).then(result => {
-      if (result.started === true) {
-        log(`启动重测已开始（${result.total} 个模型）`)
+      if (result.started !== true) {
+        log(`启动重测未开始：${result.reason ?? '未知原因'}`)
         return
       }
-      log(`启动重测未开始：${result.reason ?? '未知原因'}`)
+      log(`启动重测已完成（${result.total} 个模型）`)
+      /**
+       * 启动重测同样要收敛勾选——用户要求的是「重测全部后默认只选 ≥ 门槛的」，
+       * 而启动重测就是一次自动的「重测全部」。跑完还要 refresh 一次，因为清单
+       * 变了，链成员随之变化。
+       */
+      if (result.cancelled !== true) {
+        const cut = applyThroughputCut()
+        if (cut.changed.length > 0) void refresh().catch(() => {})
+      }
     }).catch(error => logger.warn?.(`[baipiao] 启动重测失败（不影响调用）：${String(error?.message ?? error)}`))
   }
 
@@ -4602,7 +4745,15 @@ export function apply(ctx, rawConfig) {
               minTokensPerSecond: config.minTokensPerSecond,
               onProgress: (done, total) => { if (done % 25 === 0 || done === total) log(`自动测速 ${done}/${total}`) },
             }).then(result => {
-              if (result.started === true) log(`重新分层后自动测速 ${result.total} 个模型`)
+              if (result.started !== true) return
+              log(`重新分层后自动测速已完成（${result.total} 个模型）`)
+              /**
+               * 补测跑完也要收敛勾选。虽然这条路径测的是「还没有画像的」模型，
+               * 但它同样会产生新画像——新画像跨过门槛的模型会因此被纳入，低于
+               * 门槛的会被剔除。与「重测全部」保持同一套语义，用户不必记两条路径。
+               */
+              const cut = applyThroughputCut()
+              if (cut.changed.length > 0) void refresh().catch(() => {})
             }).catch(error => logger.warn?.(`[baipiao] 自动测速失败：${String(error?.message ?? error)}`))
           }
         } catch (error) {
@@ -4669,7 +4820,19 @@ export function apply(ctx, rawConfig) {
           logger.warn?.(`[baipiao] 速度探测失败：${String(error?.message ?? error)}`)
           return { started: false, total: 0, reason: String(error?.message ?? error) }
         })
-        return send(200, { ...probeSnapshot(), candidates: list.length, ...result })
+        /**
+         * 「重测全部」跑完之后，把四条链的勾选收敛到**通过吞吐门槛**的那批。
+         *
+         * 这是用户要的「重测全部后默认只选 ≥ 门槛的模型」：不是再加一道运行时
+         * 过滤（那已经有了），而是直接改勾选清单，让设置页显示的就是实际在用的。
+         *
+         * 只在真跑完时做——被取消的一轮（`cancelled`）样本不全，据此改清单会
+         * 误杀还没测到的模型。
+         */
+        const cut = result.started === true && result.cancelled !== true
+          ? applyThroughputCut()
+          : null
+        return send(200, { ...probeSnapshot(), candidates: list.length, ...result, cut })
       }
       /** 探测进度；页面轮询它来更新进度。 */
       if (method === 'GET' && route === '/probe/status') {
